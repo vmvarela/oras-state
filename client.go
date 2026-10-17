@@ -263,6 +263,10 @@ func (wc *workspaceClient) readStateReference(ctx context.Context, reference str
 	if err != nil {
 		return nil, err
 	}
+	return wc.readStateManifest(ctx, reference, fm)
+}
+
+func (wc *workspaceClient) readStateManifest(ctx context.Context, reference string, fm ocispec.Manifest) ([]byte, error) {
 	if fm.ArtifactType != "" && fm.ArtifactType != artifactTypeState {
 		return nil, fmt.Errorf("unexpected state manifest artifactType %q for %q", fm.ArtifactType, reference)
 	}
