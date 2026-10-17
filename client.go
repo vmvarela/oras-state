@@ -1,4 +1,4 @@
-// Package oras provides an OCI registry client for storing Terraform state as
+// Package orasstate provides an OCI registry client for storing state as
 // OCI artifacts using the ORAS (OCI Registry As Storage) protocol.
 //
 // State is stored as OCI image manifests tagged with a workspace-derived name.
@@ -509,7 +509,7 @@ func (c *Client) DeleteWorkspace(ctx context.Context, stateID string) error {
 		owned := tag == wc.stateTag || tag == wc.lockTag || tag == wc.unlockedTag ||
 			strings.HasPrefix(tag, wc.versionTagBase+stateVersionTagSeparator)
 
-		// Ghoten versions before the stver-* layout stored history as
+		// Legacy implementations before the stver-* layout stored history as
 		// state-<workspace>-v<N>. Those tags are ambiguous with valid
 		// workspace names, so only delete them after manifest ownership
 		// verification.
