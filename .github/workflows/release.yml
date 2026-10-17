@@ -1,11 +1,16 @@
 name: Release
 
 on:
+  push:
+    branches:
+      - master
+    paths:
+      - VERSION
   workflow_dispatch:
     inputs:
       version:
-        description: "Semantic version to publish (without the v prefix)"
-        required: true
+        description: "Semantic version to publish (without the v prefix). Leave empty to use VERSION."
+        required: false
         type: string
 
 permissions:
@@ -17,6 +22,7 @@ concurrency:
 
 jobs:
   release:
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -25,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: master
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - uses: actions/setup-go@v7
@@ -33,12 +39,17 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Validate version
+      - name: Resolve and validate version
         id: version
         shell: bash
         env:
-          VERSION: ${{ inputs.version }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
+          VERSION="${INPUT_VERSION:-}"
+          if [[ -z "$VERSION" ]]; then
+            VERSION="$(tr -d '[:space:]' < VERSION)"
+          fi
+
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::Invalid semantic version: $VERSION"
             exit 1
@@ -50,6 +61,7 @@ jobs:
             exit 1
           fi
 
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Verify
