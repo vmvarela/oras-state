@@ -69,7 +69,7 @@ type WorkspaceLayout uint8
 
 const (
 	// WorkspaceLayoutHashed is the default, collision-resistant layout used by
-	// terraform-provider-oras. Every workspace name maps to its full SHA-256.
+	// the strict hashed layout. Every workspace name maps to its full SHA-256.
 	WorkspaceLayoutHashed WorkspaceLayout = iota
 
 	// WorkspaceLayoutLegacy preserves the tag layout used by Ghoten
@@ -92,7 +92,7 @@ type CredentialFunc func(ctx context.Context, hostport string) (Credential, erro
 // Config holds all configurable options for the ORAS client.
 type Config struct {
 	// WorkspaceLayout selects the OCI tag layout. The zero value is the
-	// strict SHA-256 layout used by terraform-provider-oras.
+	// strict SHA-256 layout used by the strict hashed layout.
 	WorkspaceLayout WorkspaceLayout
 
 	// CredentialFunc optionally delegates credential resolution to the caller.
