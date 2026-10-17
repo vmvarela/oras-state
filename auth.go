@@ -72,11 +72,11 @@ const (
 	// terraform-provider-oras. Every workspace name maps to its full SHA-256.
 	WorkspaceLayoutHashed WorkspaceLayout = iota
 
-	// WorkspaceLayoutLegacyGhoten preserves the tag layout used by Ghoten
+	// WorkspaceLayoutLegacy preserves the tag layout used by Ghoten
 	// 1.13.0 and earlier: valid OCI tag names remain literal, while invalid
 	// names use a short "ws-" hash fallback. Use this only for compatibility
-	// with existing Ghoten repositories.
-	WorkspaceLayoutLegacyGhoten
+	// with existing literal-tag repositories.
+	WorkspaceLayoutLegacy
 )
 
 // Credential is a registry credential returned by a caller-supplied resolver.
