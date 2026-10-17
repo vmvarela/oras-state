@@ -513,7 +513,7 @@ func (c *Client) DeleteWorkspace(ctx context.Context, stateID string) error {
 		// state-<workspace>-v<N>. Those tags are ambiguous with valid
 		// workspace names, so only delete them after manifest ownership
 		// verification.
-		if !owned && c.config.WorkspaceLayout == WorkspaceLayoutLegacyGhoten &&
+		if !owned && c.config.WorkspaceLayout == WorkspaceLayoutLegacy &&
 			strings.HasPrefix(tag, wc.stateTag+stateVersionTagSeparator) {
 			manifest, fetchErr := fetchRawManifest(ctx, c.repoClient, tag)
 			if isNotFound(fetchErr) {
@@ -998,9 +998,9 @@ func (wc *workspaceClient) unlock(ctx context.Context, id string) error {
 func (c *Client) List(ctx context.Context) ([]string, error) {
 	ctx, cancel := c.opContext(ctx)
 	defer cancel()
-	if c.config.WorkspaceLayout == WorkspaceLayoutLegacyGhoten {
+	if c.config.WorkspaceLayout == WorkspaceLayoutLegacy {
 		return retryWithResult(ctx, func(ctx context.Context) ([]string, error) {
-			return listLegacyGhotenWorkspaces(ctx, c.repoClient)
+			return listLegacyWorkspaces(ctx, c.repoClient)
 		})
 	}
 	return retryWithResult(ctx, func(ctx context.Context) ([]string, error) {
@@ -1495,8 +1495,8 @@ func workspaceTagFor(workspace string) string {
 func (c *Client) workspaceTagFor(workspace string) string {
 	// A nil client is used by a few pure tag-mapping tests. Treat it as the
 	// zero-value configuration, which is the strict hashed layout.
-	if c != nil && c.config.WorkspaceLayout == WorkspaceLayoutLegacyGhoten {
-		return legacyGhotenWorkspaceTagFor(workspace)
+	if c != nil && c.config.WorkspaceLayout == WorkspaceLayoutLegacy {
+		return legacyWorkspaceTagFor(workspace)
 	}
 	return workspaceTagFor(workspace)
 }
