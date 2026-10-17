@@ -20,7 +20,7 @@ const (
 	ghcrAddr        = "ghcr.io"
 	// Keep hash-layout tests separate from artifacts left by legacy CI runs.
 	// Reusing the old repository would correctly trigger migration refusal.
-	ghcrRepoPath = "vmvarela/oras-state/workspace-hash"
+	ghcrRepoPath = "vmvarela/oras-state"
 )
 
 // requireGHCRTest skips the test unless TF_ORAS_GHCR_TEST is set and a
