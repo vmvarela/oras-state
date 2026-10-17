@@ -16,13 +16,6 @@ updates:
         update-types:
           - "minor"
           - "patch"
-    ignore:
-      # OpenTofu 1.13 currently resolves x/sync v0.22.x. Keep the shared
-      # library aligned with that dependency line while Ghoten targets 1.13.
-      - dependency-name: "golang.org/x/sync"
-        update-types:
-          - "version-update:semver-minor"
-          - "version-update:semver-major"
 
   - package-ecosystem: "github-actions"
     directory: "/"
