@@ -247,15 +247,28 @@ func (c *Client) maxStateSize() int64 {
 }
 
 func (wc *workspaceClient) get(ctx context.Context) ([]byte, error) {
-	fm, _, err := wc.fetchManifestWithDesc(ctx, wc.stateTag)
+	data, err := wc.readStateReference(ctx, wc.stateTag)
+	if isNotFound(err) {
+		return nil, nil
+	}
+	return data, err
+}
+
+// readStateReference reads one verified state manifest reference and returns
+// the logical, uncompressed state bytes. Workspace ownership is enforced by
+// fetchManifestWithDesc, and the same MaxStateSize limit applies to current
+// and historical reads.
+func (wc *workspaceClient) readStateReference(ctx context.Context, reference string) ([]byte, error) {
+	fm, _, err := wc.fetchManifestWithDesc(ctx, reference)
 	if err != nil {
-		if isNotFound(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
+	return wc.readStateManifest(ctx, reference, fm)
+}
+
+func (wc *workspaceClient) readStateManifest(ctx context.Context, reference string, fm ocispec.Manifest) ([]byte, error) {
 	if fm.ArtifactType != "" && fm.ArtifactType != artifactTypeState {
-		return nil, fmt.Errorf("unexpected state manifest artifactType %q for %q", fm.ArtifactType, wc.stateTag)
+		return nil, fmt.Errorf("unexpected state manifest artifactType %q for %q", fm.ArtifactType, reference)
 	}
 	if len(fm.Layers) == 0 {
 		return nil, nil
@@ -292,7 +305,6 @@ func (wc *workspaceClient) get(ctx context.Context) ([]byte, error) {
 	if int64(len(data)) > limit {
 		return nil, fmt.Errorf("state size exceeds maximum allowed size of %d bytes; use the max_state_size option to increase the limit", limit)
 	}
-
 	return data, nil
 }
 

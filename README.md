@@ -83,6 +83,30 @@ defer client.Unlock(ctx, "default", lockID)
 
 Callers may also provide their own HTTP client or use `BuildHTTPClient` for TLS verification, custom CAs, or explicit skip-verification behavior.
 
+## Read-only state history
+
+When version retention is enabled with `MaxVersions`, consumers can inspect retained history without knowing the OCI tag layout:
+
+```go
+versions, err := client.ListVersions(ctx, "default")
+if err != nil {
+    return err
+}
+
+for _, version := range versions {
+    fmt.Printf("%d %s %s\n", version.Version, version.UpdatedAt, version.Digest)
+}
+
+previous, err := client.GetVersion(ctx, "default", versions[0].Version)
+if errors.Is(err, orasstate.ErrStateVersionNotFound) {
+    // The retained version no longer exists.
+}
+```
+
+`ListVersions` returns versions in ascending numeric order. `GetVersion` returns the logical uncompressed state bytes and enforces the same workspace ownership, media-type, compression, and `MaxStateSize` checks as `Get`. Missing history never falls back to current state.
+
+The API deliberately exposes logical versions and verified manifest digests, not OCI tag names. It is read-only: restore, per-version deletion, and garbage collection are outside this contract.
+
 ## Concurrency model
 
 OCI mutable tags are last-writer-wins and do not provide compare-and-swap semantics.
