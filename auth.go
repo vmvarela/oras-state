@@ -72,7 +72,7 @@ const (
 	// the strict hashed layout. Every workspace name maps to its full SHA-256.
 	WorkspaceLayoutHashed WorkspaceLayout = iota
 
-	// WorkspaceLayoutLegacy preserves the tag layout used by Ghoten
+	// WorkspaceLayoutLegacy preserves the historical literal-tag layout
 	// 1.13.0 and earlier: valid OCI tag names remain literal, while invalid
 	// names use a short "ws-" hash fallback. Use this only for compatibility
 	// with existing literal-tag repositories.
