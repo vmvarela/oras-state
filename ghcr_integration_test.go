@@ -154,3 +154,53 @@ func TestGHCRIntegration_LockUnlock(t *testing.T) {
 		t.Fatalf("final unlock: %v", err)
 	}
 }
+
+// TestGHCRIntegration_HistoryAndCompression verifies compressed history
+// publication against real ghcr.io and the documented ghcr.io retention
+// behavior: automatic pruning is skipped on ghcr.io, so MaxVersions does not
+// bound history — every published version stays listed and readable.
+func TestGHCRIntegration_HistoryAndCompression(t *testing.T) {
+	token := requireGHCRTest(t)
+	ctx := context.Background()
+	ws := ghcrWorkspace()
+
+	c, err := NewClient(ghcrAddr, ghcrRepoPath, Config{
+		Token:       token,
+		Compression: true,
+		MaxVersions: 2,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	states := make([][]byte, 3)
+	for i := range states {
+		states[i] = []byte(fmt.Sprintf(`{"version":4,"serial":%d,"run":%q}`, i+1, ws))
+		if err := c.Put(ctx, ws, states[i]); err != nil {
+			t.Fatalf("Put %d: %v", i+1, err)
+		}
+	}
+	// Retention is skipped on ghcr.io, so there is nothing to wait for; this
+	// keeps parity with the other suites and asserts no retention worker ran.
+	c.WaitForRetention()
+
+	versions, err := c.ListVersions(ctx, ws)
+	if err != nil {
+		t.Fatalf("ListVersions: %v", err)
+	}
+	if len(versions) != 3 {
+		t.Fatalf("ListVersions returned %d versions, want 3 (ghcr.io pruning is skipped)", len(versions))
+	}
+	for i, metadata := range versions {
+		if metadata.Version != i+1 {
+			t.Fatalf("versions[%d] = %d, want ascending version %d", i, metadata.Version, i+1)
+		}
+		got, err := c.GetVersion(ctx, ws, i+1)
+		if err != nil {
+			t.Fatalf("GetVersion(%d): %v", i+1, err)
+		}
+		if !bytes.Equal(got, states[i]) {
+			t.Fatalf("GetVersion(%d) = %q, want %q", i+1, got, states[i])
+		}
+	}
+}
