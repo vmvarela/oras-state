@@ -248,10 +248,34 @@ func (c *Client) maxStateSize() int64 {
 
 func (wc *workspaceClient) get(ctx context.Context) ([]byte, error) {
 	data, err := wc.readStateReference(ctx, wc.stateTag)
-	if isNotFound(err) {
-		return nil, nil
+	if err != nil {
+		if isNotFound(err) && !isMissingContent(err) {
+			// The tag itself is absent: genuinely no state.
+			return nil, nil
+		}
+		if isMissingContent(err) {
+			// The tag resolved but its content is missing: existing state
+			// is incomplete and must NOT be reported as absent.
+			return nil, fmt.Errorf("state manifest at tag %q is incomplete: the tag resolved but its content is missing: %w", wc.stateTag, err)
+		}
+		return nil, err
 	}
-	return data, err
+	return data, nil
+}
+
+// missingContentError marks a NotFound that occurred while fetching content
+// whose reference had already resolved (the state/version tag exists but its
+// manifest or layer is missing). It preserves the wrapped NotFound for
+// errors.Is/isNotFound, while letting Get/GetVersion distinguish "absent
+// state" from "incomplete existing state".
+type missingContentError struct{ err error }
+
+func (e *missingContentError) Error() string { return e.err.Error() }
+func (e *missingContentError) Unwrap() error { return e.err }
+
+func isMissingContent(err error) bool {
+	var e *missingContentError
+	return errors.As(err, &e)
 }
 
 // readStateReference reads one verified state manifest reference and returns
@@ -277,6 +301,9 @@ func (wc *workspaceClient) readStateManifest(ctx context.Context, reference stri
 	layer := fm.Layers[0]
 	rc, err := wc.client.repoClient.inner.Fetch(ctx, layer)
 	if err != nil {
+		if isNotFound(err) {
+			return nil, &missingContentError{fmt.Errorf("layer %s of %q: %w", layer.Digest, reference, err)}
+		}
 		return nil, err
 	}
 	defer func() { _ = rc.Close() }()
@@ -464,6 +491,11 @@ func (wc *workspaceClient) put(ctx context.Context, state []byte) error {
 }
 
 // Delete removes the state for the given stateID. Returns nil if no state exists.
+//
+// The state tag is resolved ONCE and the resulting descriptor is pinned for
+// the bounded delete retries: a transient delete failure followed by a
+// concurrent writer publishing under the same tag must never make a retry
+// delete the later writer's manifest.
 func (c *Client) Delete(ctx context.Context, stateID string) error {
 	ctx, cancel := c.opContext(ctx)
 	defer cancel()
@@ -471,19 +503,21 @@ func (c *Client) Delete(ctx context.Context, stateID string) error {
 	if err := wc.checkWorkspace(ctx); err != nil {
 		return err
 	}
-	return retry(ctx, func(ctx context.Context) error {
-		return wc.delete(ctx)
+	desc, err := retryWithResult(ctx, func(ctx context.Context) (ocispec.Descriptor, error) {
+		return wc.client.repoClient.inner.Resolve(ctx, wc.stateTag)
 	})
-}
-
-func (wc *workspaceClient) delete(ctx context.Context) error {
-	desc, err := wc.client.repoClient.inner.Resolve(ctx, wc.stateTag)
 	if err != nil {
 		if isNotFound(err) {
 			return nil
 		}
 		return err
 	}
+	return retry(ctx, func(ctx context.Context) error {
+		return wc.delete(ctx, desc)
+	})
+}
+
+func (wc *workspaceClient) delete(ctx context.Context, desc ocispec.Descriptor) error {
 	// Reuse the GHCR Packages API fallback: registries like ghcr.io return
 	// HTTP 405 for manifest deletion. Non-GHCR registries without deletion
 	// keep a clear error.
@@ -647,8 +681,10 @@ func (wc *workspaceClient) lock(ctx context.Context, info *LockInfo) (string, er
 	// Post-write verification: one fetch, both parses — ensure we hold the lock.
 	// The cleanup is a no-op whenever the tag has moved, which is the only way
 	// parsing can fail: content addressing guarantees our own digest fetches
-	// back our own bytes.
-	cleanupOurTag := func() {
+	// back our own bytes. A cleanup FAILURE is never swallowed: it is
+	// surfaced together with the original verification failure so the caller
+	// knows the workspace may remain locked and can inspect/recover.
+	cleanupOurTag := func() error {
 		// Detached, bounded context: the caller's ctx may already be
 		// cancelled at every cleanup call site (the stability-window branch
 		// literally runs on a cancelled context), and cleanup on a cancelled
@@ -657,29 +693,55 @@ func (wc *workspaceClient) lock(ctx context.Context, info *LockInfo) (string, er
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), lockCleanupTimeout)
 		defer cancel()
 		d, err := wc.client.repoClient.inner.Resolve(cleanupCtx, wc.lockTag)
-		if err != nil || d.Digest != manifestDesc.Digest {
-			return
-		}
-		if err := wc.client.repoClient.inner.Delete(cleanupCtx, d); err != nil && isDeleteUnsupported(err) {
-			// Registries like GHCR (HTTP 405) can't delete manifests;
-			// retag to "unlocked-" so the workspace isn't locked until
-			// TTL expiry. The tag still points at our digest (checked
-			// above), so that is the expected digest for the preflight.
-			if retagErr := wc.retagToUnlocked(cleanupCtx, manifestDesc.Digest.String()); retagErr != nil {
-				slog.Debug("failed to retag lock to unlocked after failed verification", "error", retagErr)
+		if err != nil {
+			if isNotFound(err) {
+				// Confirmed absent: the lock is already gone — idempotent
+				// success, nothing stranded to clean.
+				return nil
 			}
+			return fmt.Errorf("lock-tag cleanup after failed verification: could not confirm the state of lock tag %q: %w", wc.lockTag, err)
 		}
+		if d.Digest != manifestDesc.Digest {
+			// The tag moved: nothing of ours to clean, and nothing stranded.
+			return nil
+		}
+		if err := wc.client.repoClient.inner.Delete(cleanupCtx, d); err != nil {
+			if isNotFound(err) {
+				// Confirmed absent: a concurrent cleanup already deleted our
+				// lock manifest — idempotent success.
+				return nil
+			}
+			if isDeleteUnsupported(err) {
+				// Registries like GHCR (HTTP 405) can't delete manifests;
+				// retag to "unlocked-" so the workspace isn't locked until
+				// TTL expiry. The tag still points at our digest (checked
+				// above), so that is the expected digest for the preflight.
+				if retagErr := wc.retagToUnlocked(cleanupCtx, manifestDesc.Digest.String()); retagErr != nil {
+					return fmt.Errorf("lock-tag cleanup after failed verification: manifest deletion is unsupported and retagging the lock tag to the unlocked marker failed: %w", retagErr)
+				}
+				return nil
+			}
+			return fmt.Errorf("lock-tag cleanup after failed verification: deleting our lock manifest %s failed: %w", manifestDesc.Digest, err)
+		}
+		return nil
+	}
+
+	// failVerification surfaces the verification failure, attaching any
+	// cleanup failure so a stranded lock is visible instead of silent.
+	failVerification := func(err error) error {
+		if cleanupErr := cleanupOurTag(); cleanupErr != nil {
+			return fmt.Errorf("%w; additionally, %w (the workspace may remain locked under tag %q until it is cleared via Unlock or TTL expiry)", err, cleanupErr, wc.lockTag)
+		}
+		return err
 	}
 
 	held, _, err := wc.fetchManifestWithDesc(ctx, wc.lockTag)
 	if err != nil {
-		cleanupOurTag()
-		return "", fmt.Errorf("failed to verify lock acquisition: %w", err)
+		return "", failVerification(fmt.Errorf("failed to verify lock acquisition: %w", err))
 	}
 	verified, err := parseLockManifestData(&held)
 	if err != nil {
-		cleanupOurTag()
-		return "", fmt.Errorf("failed to verify lock acquisition: %w", err)
+		return "", failVerification(fmt.Errorf("failed to verify lock acquisition: %w", err))
 	}
 	if verified.Generation != newGeneration || verified.HolderID != info.ID {
 		existing, _ := parseLockInfo(&held, wc.stateTag)
@@ -696,8 +758,7 @@ func (wc *workspaceClient) lock(ctx context.Context, info *LockInfo) (string, er
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		cleanupOurTag()
-		return "", ctx.Err()
+		return "", failVerification(ctx.Err())
 	case <-timer.C:
 	}
 
@@ -705,8 +766,7 @@ func (wc *workspaceClient) lock(ctx context.Context, info *LockInfo) (string, er
 	// contention and do NOT clear a tag that points at another holder.
 	stable, stableDesc, err := wc.fetchManifestWithDesc(ctx, wc.lockTag)
 	if err != nil {
-		cleanupOurTag()
-		return "", fmt.Errorf("failed to confirm lock stability: %w", err)
+		return "", failVerification(fmt.Errorf("failed to confirm lock stability: %w", err))
 	}
 	if stableDesc.Digest != manifestDesc.Digest {
 		existing, _ := parseLockInfo(&stable, wc.stateTag)
@@ -837,11 +897,11 @@ const tagPrePushNotFoundRetryDelay = 100 * time.Millisecond
 // publication errors. The helper handles exactly the pinned ORAS pre-PUT
 // GET-404 path and nothing else.
 //
-// Scope of the 3-attempt cap: it bounds ONE helper call. The unlock/retag
-// paths keep their existing outer transient retry, which may invoke this
-// helper again after a mixed (transient + not-found) sequence; a pure
-// ErrNotFound exhaustion is NOT transient, so the outer loop never retries
-// it — no retry loop unbounded by the cap itself exists.
+// Scope of the 3-attempt cap: it bounds ONE helper call. Callers must never
+// wrap this helper in an outer blind retry: a transient PUT failure keeps
+// its fail-closed observation handling (publishMutableTag), so no retry
+// loop replays a mutable-tag PUT whose response was lost. A pure
+// ErrNotFound exhaustion is NOT transient and is surfaced as-is.
 //
 // KNOWN LIMITATION — accepted, NOT concurrency-safe: OCI tags are
 // unconditional last-writer-wins (no CAS). Between a 404 and the retried
@@ -853,9 +913,8 @@ const tagPrePushNotFoundRetryDelay = 100 * time.Millisecond
 // immediately — including a tag PUT that failed with an HTTP 404
 // ErrorResponse, which is a remote errcode.ErrorResponse, NOT
 // errdef.ErrNotFound — and transient PUT failures keep their existing
-// per-callsite handling (observation in publishMutableTag, the pre-existing
-// outer transient retry in retagToUnlocked; retagToNewManifest surfaces
-// non-sentinel errors as before).
+// per-callsite handling (observation in publishMutableTag; retagToNewManifest
+// surfaces non-sentinel errors as before).
 func tagPrePushNotFoundRetry(ctx context.Context, repo orasRepository, desc ocispec.Descriptor, reference string) error {
 	for attempt := 1; ; attempt++ {
 		err := repo.Tag(ctx, desc, reference)
@@ -1385,9 +1444,12 @@ func (wc *workspaceClient) retagToUnlocked(ctx context.Context, expectedDigest s
 		return fmt.Errorf("lock tag %q changed before retag to unlocked (another holder may have re-locked)", wc.lockTag)
 	}
 
-	if err := retry(ctx, func(ctx context.Context) error {
-		return tagPrePushNotFoundRetry(ctx, wc.client.repoClient.inner, desc, wc.lockTag)
-	}); err != nil {
+	// The lock-marker write goes through publishMutableTag: a transient
+	// (response-lost or failed) result is OBSERVED, never blindly re-applied —
+	// a retried marker PUT could overwrite a rival that re-locked in the gap.
+	// The documented no-CAS limit is unchanged: the pre-push digest-GET 404
+	// inside tagPrePushNotFoundRetry keeps its bounded, stale-intent retry.
+	if err := wc.publishMutableTag(ctx, desc, wc.lockTag); err != nil {
 		return err
 	}
 	return wc.verifyUnlockedMarker(ctx, desc)
@@ -1433,6 +1495,9 @@ func (wc *workspaceClient) fetchManifestInternal(ctx context.Context, reference 
 	}
 	rc, err := wc.client.repoClient.inner.Fetch(ctx, desc)
 	if err != nil {
+		if isNotFound(err) {
+			return ocispec.Manifest{}, ocispec.Descriptor{}, &missingContentError{fmt.Errorf("manifest %s for %q: %w", desc.Digest, reference, err)}
+		}
 		return ocispec.Manifest{}, ocispec.Descriptor{}, err
 	}
 	defer func() { _ = rc.Close() }()

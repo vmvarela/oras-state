@@ -63,7 +63,6 @@ func userAgent(configured ...string) string {
 	return "oras-state/" + Version
 }
 
-
 // WorkspaceLayout controls how logical state/workspace names map to OCI tags.
 type WorkspaceLayout uint8
 
@@ -161,8 +160,10 @@ type orasRepositoryClient struct {
 // accessToken returns the access token for GHCR API calls. Falls back to the
 // resolved credential (AccessToken, then Password) so that configured
 // credentials (CLI config, Docker config files, helpers) also work for the
-// GHCR delete fallback, not just env/explicit tokens.
-func (r *orasRepositoryClient) accessToken(_ context.Context) (string, error) {
+// GHCR delete fallback, not just env/explicit tokens. The operation context
+// is propagated into the caller CredentialFunc so cancellation (and any
+// per-call values) reach credential resolution; discovery policy is unchanged.
+func (r *orasRepositoryClient) accessToken(ctx context.Context) (string, error) {
 	if r.token != "" {
 		return r.token, nil
 	}
@@ -173,7 +174,7 @@ func (r *orasRepositoryClient) accessToken(_ context.Context) (string, error) {
 		return r.resolvedCred.Password, nil
 	}
 	if r.credentialFn != nil {
-		cred, err := r.credentialFn(context.Background(), normalizeRegistryHost(strings.SplitN(r.repository, "/", 2)[0]))
+		cred, err := r.credentialFn(ctx, normalizeRegistryHost(strings.SplitN(r.repository, "/", 2)[0]))
 		if err != nil {
 			return "", err
 		}

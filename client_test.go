@@ -594,9 +594,19 @@ func TestRemoteClient_Delete(t *testing.T) {
 	fake := newFakeORASRepo()
 	repo := &orasRepositoryClient{inner: fake}
 	c := newRemoteClient(repo, "default")
+	deleteState := func() error {
+		desc, err := fake.Resolve(ctx, c.stateTag)
+		if errors.Is(err, errdef.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return c.delete(ctx, desc)
+	}
 
 	// Delete from empty repo should succeed (no state).
-	if err := c.delete(ctx); err != nil {
+	if err := deleteState(); err != nil {
 		t.Fatalf("delete on empty: %v", err)
 	}
 
@@ -604,7 +614,7 @@ func TestRemoteClient_Delete(t *testing.T) {
 	if err := c.put(ctx, []byte("state-data")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if err := c.delete(ctx); err != nil {
+	if err := deleteState(); err != nil {
 		t.Fatalf("delete after put: %v", err)
 	}
 
@@ -647,7 +657,11 @@ func TestRemoteClient_Delete_WithVersioning(t *testing.T) {
 	client.retentionWg.Wait()
 
 	// Now delete the whole workspace.
-	if err := c.delete(ctx); err != nil {
+	desc, derr := fake.Resolve(ctx, c.stateTag)
+	if derr != nil {
+		t.Fatalf("resolve state tag before delete: %v", derr)
+	}
+	if err := c.delete(ctx, desc); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 

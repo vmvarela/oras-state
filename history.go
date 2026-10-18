@@ -105,6 +105,11 @@ func (c *Client) GetVersion(ctx context.Context, stateID string, version int) ([
 	fm, _, err := wc.fetchManifestWithDesc(ctx, reference)
 	if err != nil {
 		if isNotFound(err) {
+			if isMissingContent(err) {
+				// The version tag resolved but its content is missing:
+				// incomplete existing state, distinct from an absent version.
+				return nil, fmt.Errorf("state version %d at %q is incomplete: the tag resolved but its content is missing: %w", version, reference, err)
+			}
 			return nil, fmt.Errorf("%w: %d", ErrStateVersionNotFound, version)
 		}
 		return nil, err
