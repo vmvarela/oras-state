@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -436,5 +437,130 @@ func TestZotIntegration_Compression(t *testing.T) {
 
 	if !bytes.Equal(got, original) {
 		t.Fatal("gzip round-trip mismatch")
+	}
+}
+
+// TestZotIntegration_MutableTagConcurrency verifies the documented mutable-tag
+// concurrency semantics against a live zot registry: OCI tags are
+// last-writer-wins without CAS, so independent clients may overwrite each
+// other, but a reader always observes exactly one writer's payload
+// byte-intact.
+//
+// ErrMutableTagMoved is deliberately not exercised here: reproducing it
+// against a live registry requires injecting a transient tag-PUT failure into
+// one writer while a rival moves the tag mid-observation — a timing race, not
+// deterministic. The seam-based tests in mutabletag_test.go cover that path.
+func TestZotIntegration_MutableTagConcurrency(t *testing.T) {
+	requireZotTest(t)
+	ctx := context.Background()
+	port := freeLocalPort(t)
+	addr := "localhost:" + port
+	startZot(t, port)
+	waitForZot(t, addr)
+
+	const ws = "concurrent"
+	const wsConcurrent = "concurrent-parallel"
+	const writers = 4
+	payloads := make([][]byte, writers)
+	for i := range payloads {
+		payloads[i] = append(
+			[]byte(fmt.Sprintf(`{"writer":%d,"pad":"`, i)),
+			bytes.Repeat([]byte(fmt.Sprintf("%02d-", i)), 32*1024)...,
+		)
+		payloads[i] = append(payloads[i], []byte(`"}`)...)
+	}
+
+	repo := "provider-test/mutable-concurrency"
+	clients := make([]*Client, writers)
+	for i := range clients {
+		clients[i] = newZotClient(t, addr, repo, Config{})
+	}
+
+	// Sequential LWW: two independent clients write different payloads to
+	// the same workspace; the second write wins and reads return its
+	// payload byte-intact.
+	if err := clients[0].Put(ctx, ws, payloads[0]); err != nil {
+		t.Fatalf("first Put: %v", err)
+	}
+	if err := clients[1].Put(ctx, ws, payloads[1]); err != nil {
+		t.Fatalf("second Put: %v", err)
+	}
+	got, err := clients[0].Get(ctx, ws)
+	if err != nil {
+		t.Fatalf("Get after sequential writes: %v", err)
+	}
+	if !bytes.Equal(got, payloads[1]) {
+		t.Fatal("sequential last-writer-wins: Get did not return the second writer's payload byte-intact")
+	}
+
+	// Concurrent writers: each Put either succeeds or fails per the
+	// documented LWW semantics (no CAS). Failures are tolerated and logged;
+	// after every writer has returned, the mutable tag must resolve to
+	// exactly one of the successfully published payloads, byte-intact. A
+	// separate workspace keeps a stale sequential-phase payload from masking
+	// a total concurrent-write failure.
+	var wg sync.WaitGroup
+	errs := make([]error, writers)
+	for i := range clients {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = clients[i].Put(ctx, wsConcurrent, payloads[i])
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Logf("writer %d Put failed per LWW semantics: %v", i, err)
+		}
+	}
+
+	final, err := clients[0].Get(ctx, wsConcurrent)
+	if err != nil {
+		t.Fatalf("final Get: %v", err)
+	}
+	matched := false
+	for i, want := range payloads {
+		if errs[i] == nil && bytes.Equal(final, want) {
+			matched = true
+			t.Logf("final state was written by writer %d", i)
+			break
+		}
+	}
+	if !matched {
+		t.Fatalf("final Get returned a payload matching no writer (corruption/truncation): %d bytes, prefix %q", len(final), string(final[:min(64, len(final))]))
+	}
+}
+
+// TestZotIntegration_LargeState verifies a ~2 MiB state round-trips
+// byte-intact against a live zot registry. The default MaxStateSize is
+// 256 MiB (defaultMaxStateSize), so no explicit Config.MaxStateSize override
+// is needed.
+func TestZotIntegration_LargeState(t *testing.T) {
+	requireZotTest(t)
+	ctx := context.Background()
+	port := freeLocalPort(t)
+	addr := "localhost:" + port
+	startZot(t, port)
+	waitForZot(t, addr)
+
+	c := newZotClient(t, addr, "provider-test/large-state", Config{})
+
+	// Deterministic ~2 MiB payload with per-offset variation to catch
+	// truncation and offset corruption.
+	large := make([]byte, 2*1024*1024)
+	for i := range large {
+		large[i] = byte(i % 251)
+	}
+
+	if err := c.Put(ctx, "default", large); err != nil {
+		t.Fatalf("Put ~2MiB: %v", err)
+	}
+	got, err := c.Get(ctx, "default")
+	if err != nil {
+		t.Fatalf("Get ~2MiB: %v", err)
+	}
+	if !bytes.Equal(got, large) {
+		t.Fatalf("large round-trip mismatch: got %d bytes, want %d", len(got), len(large))
 	}
 }
