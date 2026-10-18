@@ -117,7 +117,12 @@ type Config struct {
 	Compression bool // gzip when true
 	// LockTTL is the lock lease duration; 0 means locks never expire.
 	LockTTL time.Duration
-	// MaxVersions is the number of state versions to retain; <= 0 disables versioning.
+	// MaxVersions is the target number of retained state versions. A value
+	// <= 0 stops publishing version history (already-published history can
+	// remain readable). Retention is best-effort: legacy or ambiguous
+	// entries may be preserved, and ghcr.io never prunes automatically —
+	// history stays published and readable there, but MaxVersions does not
+	// bound it.
 	MaxVersions int
 	// MaxStateSize is the upper bound on state data; <= 0 uses the 256 MiB default.
 	MaxStateSize int64
