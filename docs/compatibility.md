@@ -26,8 +26,8 @@ The mandatory CI target. Tests run PlainHTTP without authentication, using eithe
 
 ### GitHub Container Registry (ghcr.io)
 
-- Manifest `DELETE` is not supported (HTTP 405). The engine falls back to the GitHub Packages API for pruning.
-- Because that fallback is best-effort, automatic pruning is skipped on `ghcr.io`: history keeps growing regardless of `MaxVersions`. Stop old writers before relying on retention semantics.
+- Manifest `DELETE` is not supported (HTTP 405). Explicit `Delete`/`DeleteWorkspace` fall back to the GitHub Packages API; `Unlock` retags the lock tag to an `unlocked-` marker instead.
+- Automatic pruning is skipped entirely on `ghcr.io` — `Put` issues no delete at all — so `MaxVersions` does not bound history there and it can grow without limit. Explicit deletes still work through the Packages API fallback.
 - Deleting the last tagged version of a package can be rejected by GHCR; the integration tests keep an anchor fixture for this reason.
 - Authentication uses a token with `packages:write` scope (the CI job uses the workflow `GITHUB_TOKEN`).
 

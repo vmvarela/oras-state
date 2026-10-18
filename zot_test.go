@@ -459,6 +459,7 @@ func TestZotIntegration_MutableTagConcurrency(t *testing.T) {
 	waitForZot(t, addr)
 
 	const ws = "concurrent"
+	const wsConcurrent = "concurrent-parallel"
 	const writers = 4
 	payloads := make([][]byte, writers)
 	for i := range payloads {
@@ -470,7 +471,6 @@ func TestZotIntegration_MutableTagConcurrency(t *testing.T) {
 	}
 
 	repo := "provider-test/mutable-concurrency"
-	first := newZotClient(t, addr, repo, Config{})
 	clients := make([]*Client, writers)
 	for i := range clients {
 		clients[i] = newZotClient(t, addr, repo, Config{})
@@ -479,13 +479,13 @@ func TestZotIntegration_MutableTagConcurrency(t *testing.T) {
 	// Sequential LWW: two independent clients write different payloads to
 	// the same workspace; the second write wins and reads return its
 	// payload byte-intact.
-	if err := first.Put(ctx, ws, payloads[0]); err != nil {
+	if err := clients[0].Put(ctx, ws, payloads[0]); err != nil {
 		t.Fatalf("first Put: %v", err)
 	}
 	if err := clients[1].Put(ctx, ws, payloads[1]); err != nil {
 		t.Fatalf("second Put: %v", err)
 	}
-	got, err := first.Get(ctx, ws)
+	got, err := clients[0].Get(ctx, ws)
 	if err != nil {
 		t.Fatalf("Get after sequential writes: %v", err)
 	}
@@ -496,14 +496,16 @@ func TestZotIntegration_MutableTagConcurrency(t *testing.T) {
 	// Concurrent writers: each Put either succeeds or fails per the
 	// documented LWW semantics (no CAS). Failures are tolerated and logged;
 	// after every writer has returned, the mutable tag must resolve to
-	// exactly one of the published payloads, byte-intact.
+	// exactly one of the successfully published payloads, byte-intact. A
+	// separate workspace keeps a stale sequential-phase payload from masking
+	// a total concurrent-write failure.
 	var wg sync.WaitGroup
 	errs := make([]error, writers)
 	for i := range clients {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			errs[i] = clients[i].Put(ctx, ws, payloads[i])
+			errs[i] = clients[i].Put(ctx, wsConcurrent, payloads[i])
 		}(i)
 	}
 	wg.Wait()
@@ -513,13 +515,13 @@ func TestZotIntegration_MutableTagConcurrency(t *testing.T) {
 		}
 	}
 
-	final, err := first.Get(ctx, ws)
+	final, err := clients[0].Get(ctx, wsConcurrent)
 	if err != nil {
 		t.Fatalf("final Get: %v", err)
 	}
 	matched := false
 	for i, want := range payloads {
-		if bytes.Equal(final, want) {
+		if errs[i] == nil && bytes.Equal(final, want) {
 			matched = true
 			t.Logf("final state was written by writer %d", i)
 			break

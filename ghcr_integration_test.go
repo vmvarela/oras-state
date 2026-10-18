@@ -180,6 +180,16 @@ func TestGHCRIntegration_HistoryAndCompression(t *testing.T) {
 			t.Fatalf("Put %d: %v", i+1, err)
 		}
 	}
+	// Sequential overwrite of the mutable state tag: the latest Put wins and
+	// Get observes it byte-intact.
+	latest, err := c.Get(ctx, ws)
+	if err != nil {
+		t.Fatalf("Get after sequential Puts: %v", err)
+	}
+	if !bytes.Equal(latest, states[len(states)-1]) {
+		t.Fatalf("Get returned %q, want the latest payload %q", latest, states[len(states)-1])
+	}
+
 	// Retention is skipped on ghcr.io, so there is nothing to wait for; this
 	// keeps parity with the other suites and asserts no retention worker ran.
 	c.WaitForRetention()
