@@ -83,9 +83,11 @@ defer client.Unlock(ctx, "default", lockID)
 
 Callers may also provide their own HTTP client or use `BuildHTTPClient` for TLS verification, custom CAs, or explicit skip-verification behavior.
 
+`Get` returns `nil` state when the current tag is absent. If a tag resolves but its manifest or layer content is missing, `Get` returns an error instead of reporting the state as absent.
+
 ## Read-only state history
 
-When version retention is enabled with `MaxVersions`, consumers can inspect retained history without knowing the OCI tag layout:
+A positive `MaxVersions` enables and publishes state-version history — including on ghcr.io, where pruning is skipped — so consumers can inspect retained history without knowing the OCI tag layout:
 
 ```go
 versions, err := client.ListVersions(ctx, "default")
@@ -97,13 +99,22 @@ for _, version := range versions {
     fmt.Printf("%d %s %s\n", version.Version, version.UpdatedAt, version.Digest)
 }
 
-previous, err := client.GetVersion(ctx, "default", versions[0].Version)
-if errors.Is(err, orasstate.ErrStateVersionNotFound) {
-    // The retained version no longer exists.
+if len(versions) > 0 {
+    previous, err := client.GetVersion(ctx, "default", versions[0].Version)
+    if err != nil && !errors.Is(err, orasstate.ErrStateVersionNotFound) {
+        return err
+    }
+    if previous != nil {
+        fmt.Printf("previous version: %d bytes\n", len(previous))
+    }
 }
 ```
 
-`ListVersions` returns versions in ascending numeric order. `GetVersion` returns the logical uncompressed state bytes and enforces the same workspace ownership, media-type, compression, and `MaxStateSize` checks as `Get`. Missing history never falls back to current state.
+`ListVersions` returns versions in ascending numeric order. `GetVersion` returns the logical uncompressed state bytes and enforces the same workspace ownership, media-type, compression, and `MaxStateSize` checks as `Get`. A missing version returns an error wrapping `ErrStateVersionNotFound` — history never falls back to current state. If `GetVersion` resolves a version tag but its manifest or layer content is missing, it returns a distinct error (not `ErrStateVersionNotFound`): incomplete history is never reported as absent.
+
+`MaxVersions <= 0` stops publishing new version history (already-published history can remain readable); a positive value publishes history and targets that many retained versions. On registries other than ghcr.io, pruning is best-effort: unmarked, unknown, or ambiguous legacy entries may be preserved. On ghcr.io, history is still published and readable, but automatic pruning is skipped — `MaxVersions` does **not** bound history there, and it may grow without limit.
+
+Before relying on the new retention behavior, stop old writers and wait for their asynchronous retention workers to finish: a new instance does not fence or protect against old processes still reading, writing, or pruning.
 
 The API deliberately exposes logical versions and verified manifest digests, not OCI tag names. It is read-only: restore, per-version deletion, and garbage collection are outside this contract.
 
@@ -115,7 +126,7 @@ OCI mutable tags are last-writer-wins and do not provide compare-and-swap semant
 
 In particular, `ErrMutableTagMoved` means a mutable tag moved or became ambiguous and the caller should stop rather than retry the publication blindly.
 
-A `PartialPublicationError` means the main state tag was published successfully but a later publication step, such as a version tag, failed. Callers must not treat that as a wholly failed state write.
+A `PartialPublicationError` means the main state tag was published at the time of the write, but a later publication step, such as the history tag, failed. Callers must not treat that as a wholly failed state write, and must not assume the state tag remains current when the error is observed: a concurrent writer may already have superseded it.
 
 ## Workspace layout
 

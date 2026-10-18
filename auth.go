@@ -63,7 +63,6 @@ func userAgent(configured ...string) string {
 	return "oras-state/" + Version
 }
 
-
 // WorkspaceLayout controls how logical state/workspace names map to OCI tags.
 type WorkspaceLayout uint8
 
@@ -118,7 +117,12 @@ type Config struct {
 	Compression bool // gzip when true
 	// LockTTL is the lock lease duration; 0 means locks never expire.
 	LockTTL time.Duration
-	// MaxVersions is the number of state versions to retain; <= 0 disables versioning.
+	// MaxVersions is the target number of retained state versions. A value
+	// <= 0 stops publishing version history (already-published history can
+	// remain readable). Retention is best-effort: legacy or ambiguous
+	// entries may be preserved, and ghcr.io never prunes automatically —
+	// history stays published and readable there, but MaxVersions does not
+	// bound it.
 	MaxVersions int
 	// MaxStateSize is the upper bound on state data; <= 0 uses the 256 MiB default.
 	MaxStateSize int64
@@ -161,8 +165,10 @@ type orasRepositoryClient struct {
 // accessToken returns the access token for GHCR API calls. Falls back to the
 // resolved credential (AccessToken, then Password) so that configured
 // credentials (CLI config, Docker config files, helpers) also work for the
-// GHCR delete fallback, not just env/explicit tokens.
-func (r *orasRepositoryClient) accessToken(_ context.Context) (string, error) {
+// GHCR delete fallback, not just env/explicit tokens. The operation context
+// is propagated into the caller CredentialFunc so cancellation (and any
+// per-call values) reach credential resolution; discovery policy is unchanged.
+func (r *orasRepositoryClient) accessToken(ctx context.Context) (string, error) {
 	if r.token != "" {
 		return r.token, nil
 	}
@@ -173,7 +179,7 @@ func (r *orasRepositoryClient) accessToken(_ context.Context) (string, error) {
 		return r.resolvedCred.Password, nil
 	}
 	if r.credentialFn != nil {
-		cred, err := r.credentialFn(context.Background(), normalizeRegistryHost(strings.SplitN(r.repository, "/", 2)[0]))
+		cred, err := r.credentialFn(ctx, normalizeRegistryHost(strings.SplitN(r.repository, "/", 2)[0]))
 		if err != nil {
 			return "", err
 		}
