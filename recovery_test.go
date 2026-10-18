@@ -12,8 +12,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +25,680 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2/errdef"
 )
+
+// ─── Phase 2: distinct current/history manifests (issue #9) ──────────────────
+
+// countingOpsRepo counts Tag and Delete calls, delegating everything.
+type countingOpsRepo struct {
+	delegatingRepo
+
+	mu          sync.Mutex
+	tagCalls    int
+	deleteCalls int
+}
+
+func (r *countingOpsRepo) Tag(ctx context.Context, desc ocispec.Descriptor, reference string) error {
+	r.mu.Lock()
+	r.tagCalls++
+	r.mu.Unlock()
+	return r.delegatingRepo.Tag(ctx, desc, reference)
+}
+
+func (r *countingOpsRepo) Delete(ctx context.Context, target ocispec.Descriptor) error {
+	r.mu.Lock()
+	r.deleteCalls++
+	r.mu.Unlock()
+	return r.delegatingRepo.Delete(ctx, target)
+}
+
+func (r *countingOpsRepo) counts() (tags, deletes int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.tagCalls, r.deleteCalls
+}
+
+// deleteTrackingRepo records every deleted digest and counts Tag calls,
+// delegating everything.
+type deleteTrackingRepo struct {
+	delegatingRepo
+
+	mu       sync.Mutex
+	deleted  []digest.Digest
+	tagCalls int
+}
+
+func (r *deleteTrackingRepo) Tag(ctx context.Context, desc ocispec.Descriptor, reference string) error {
+	r.mu.Lock()
+	r.tagCalls++
+	r.mu.Unlock()
+	return r.delegatingRepo.Tag(ctx, desc, reference)
+}
+
+func (r *deleteTrackingRepo) Delete(ctx context.Context, target ocispec.Descriptor) error {
+	r.mu.Lock()
+	r.deleted = append(r.deleted, target.Digest)
+	r.mu.Unlock()
+	return r.delegatingRepo.Delete(ctx, target)
+}
+
+// errHistoryPackFailed is the non-transient sentinel injected into the Push
+// of any manifest carrying a history marker (the H preparation step).
+var errHistoryPackFailed = errors.New("history manifest push failed (test sentinel)")
+
+// historyPackFailRepo fails the Push of history manifests only; every other
+// payload (layers, config, current manifests) is forwarded. Content readers
+// are consumed, so the payload is re-wrapped before delegating.
+type historyPackFailRepo struct {
+	delegatingRepo
+}
+
+func (r *historyPackFailRepo) Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
+	b, err := io.ReadAll(content)
+	if err != nil {
+		return err
+	}
+	var m ocispec.Manifest
+	if json.Unmarshal(b, &m) == nil && m.Annotations[annotationStateHistory] != "" {
+		return errHistoryPackFailed
+	}
+	return r.delegatingRepo.Push(ctx, expected, bytes.NewReader(b))
+}
+
+// seedVersionManifest pushes a state manifest for version N — with an
+// optional history marker and the LITERAL artifact type given ("" produces
+// an untyped manifest) — and tags it stver-*-vN. Returns the manifest
+// descriptor.
+func seedVersionManifest(ctx context.Context, t *testing.T, fake *fakeORASRepo, wc *workspaceClient, version int, data string, marker bool, artifactType string) ocispec.Descriptor {
+	t.Helper()
+	layerDesc := ocispec.Descriptor{
+		MediaType: mediaTypeStateLayer,
+		Digest:    digest.FromBytes([]byte(data)),
+		Size:      int64(len(data)),
+	}
+	if err := fake.Push(ctx, layerDesc, bytes.NewReader([]byte(data))); err != nil {
+		t.Fatalf("push layer: %v", err)
+	}
+	now := "2026-01-01T00:00:00Z"
+	annotations := map[string]string{
+		annotationWorkspace:    wc.stateID,
+		annotationUpdatedAt:    now,
+		annotationCreated:      now,
+		annotationStateVersion: strconv.Itoa(version),
+	}
+	if marker {
+		annotations[annotationStateHistory] = strconv.Itoa(version)
+	}
+	raw, err := json.Marshal(ocispec.Manifest{
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: artifactType,
+		Annotations:  annotations,
+		Layers:       []ocispec.Descriptor{layerDesc},
+	})
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	desc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.FromBytes(raw),
+		Size:      int64(len(raw)),
+	}
+	if err := fake.Push(ctx, desc, bytes.NewReader(raw)); err != nil {
+		t.Fatalf("push manifest: %v", err)
+	}
+	if err := fake.Tag(ctx, desc, wc.versionTagFor(version)); err != nil {
+		t.Fatalf("tag version %d: %v", version, err)
+	}
+	return desc
+}
+
+// TestPut_CurrentAndHistoryManifestsDistinct — a versioned Put publishes two
+// DISTINCT manifests: C (state tag, no history marker) and H (version tag,
+// dedicated marker), sharing the same state layer, both keeping the state
+// artifact type and workspace/updated_at/version annotations (legacy reader
+// compatibility). Bytes and created timestamps are identical under raw and
+// gzip layers.
+func TestPut_CurrentAndHistoryManifestsDistinct(t *testing.T) {
+	ctx := context.Background()
+	payload := "history-protocol-state"
+	for _, compression := range []bool{false, true} {
+		t.Run(fmt.Sprintf("compression=%t", compression), func(t *testing.T) {
+			fake := newFakeORASRepo()
+			repo := &orasRepositoryClient{inner: fake, repository: "example.com/test/repo"}
+			c := newTestClient(repo)
+			c.config.MaxVersions = 3
+			c.config.Compression = compression
+			wc := newRemoteClient(repo, "default")
+
+			if err := c.Put(ctx, "default", []byte(payload)); err != nil {
+				t.Fatalf("put: %v", err)
+			}
+			c.WaitForRetention()
+
+			current, currentDesc, err := wc.fetchManifestWithDesc(ctx, wc.stateTag)
+			if err != nil {
+				t.Fatalf("fetch current manifest: %v", err)
+			}
+			history, historyDesc, err := wc.fetchManifestWithDesc(ctx, wc.versionTagFor(1))
+			if err != nil {
+				t.Fatalf("fetch history manifest: %v", err)
+			}
+
+			if currentDesc.Digest == historyDesc.Digest {
+				t.Fatal("current and history manifests share a digest; they must be distinct manifests")
+			}
+			if len(current.Layers) != 1 || len(history.Layers) != 1 {
+				t.Fatalf("layers = %d/%d, want 1/1", len(current.Layers), len(history.Layers))
+			}
+			if current.Layers[0].Digest != history.Layers[0].Digest {
+				t.Error("current and history manifests must share the same state layer")
+			}
+			wantLayer := mediaTypeStateLayer
+			if compression {
+				wantLayer = mediaTypeStateLayerGzip
+			}
+			if current.Layers[0].MediaType != wantLayer || history.Layers[0].MediaType != wantLayer {
+				t.Errorf("layer media types = %q/%q, want %q", current.Layers[0].MediaType, history.Layers[0].MediaType, wantLayer)
+			}
+			if _, marked := current.Annotations[annotationStateHistory]; marked {
+				t.Error("current manifest must not carry the history marker")
+			}
+			if history.Annotations[annotationStateHistory] != "1" {
+				t.Errorf("history marker = %q, want %q", history.Annotations[annotationStateHistory], "1")
+			}
+			// Legacy reader compatibility: the shared annotation surface.
+			for name, m := range map[string]ocispec.Manifest{"current": current, "history": history} {
+				if m.Annotations[annotationWorkspace] != "default" {
+					t.Errorf("%s workspace annotation = %q", name, m.Annotations[annotationWorkspace])
+				}
+				if m.Annotations[annotationStateVersion] != "1" {
+					t.Errorf("%s version annotation = %q", name, m.Annotations[annotationStateVersion])
+				}
+				if m.ArtifactType != "" && m.ArtifactType != artifactTypeState {
+					t.Errorf("%s artifactType = %q", name, m.ArtifactType)
+				}
+				if _, err := time.Parse(time.RFC3339, m.Annotations[annotationCreated]); err != nil {
+					t.Errorf("%s created annotation %q is not RFC3339: %v", name, m.Annotations[annotationCreated], err)
+				}
+			}
+			if current.Annotations[annotationCreated] == "" || current.Annotations[annotationCreated] != history.Annotations[annotationCreated] {
+				t.Errorf("created annotations differ (%q vs %q); a logical Put must use a single RFC3339 value",
+					current.Annotations[annotationCreated], history.Annotations[annotationCreated])
+			}
+
+			// Bytes preserved through both readers.
+			if got, err := c.Get(ctx, "default"); err != nil || string(got) != payload {
+				t.Errorf("Get = (%q, %v), want %q", got, err, payload)
+			}
+			if got, err := c.GetVersion(ctx, "default", 1); err != nil || string(got) != payload {
+				t.Errorf("GetVersion(1) = (%q, %v), want %q", got, err, payload)
+			}
+		})
+	}
+}
+
+// TestPackStateManifestReproducibleWithFixedCreated — with created fixed to
+// one value per logical Put, packing the same annotations twice yields the
+// same manifest digest (ORAS PackManifest would otherwise stamp the wall
+// clock per call).
+func TestPackStateManifestReproducibleWithFixedCreated(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	repo := &orasRepositoryClient{inner: fake, repository: "example.com/test/repo"}
+	wc := newRemoteClient(repo, "default")
+
+	data := "reproducible-state"
+	layerDesc := ocispec.Descriptor{
+		MediaType: mediaTypeStateLayer,
+		Digest:    digest.FromBytes([]byte(data)),
+		Size:      int64(len(data)),
+	}
+	if err := fake.Push(ctx, layerDesc, bytes.NewReader([]byte(data))); err != nil {
+		t.Fatalf("push layer: %v", err)
+	}
+	annotations := map[string]string{
+		annotationWorkspace:    "default",
+		annotationUpdatedAt:    "2026-01-01T00:00:00Z",
+		annotationCreated:      "2026-01-01T00:00:00Z",
+		annotationStateVersion: "1",
+	}
+	d1, err := wc.packStateManifestAnnotated(ctx, []ocispec.Descriptor{layerDesc}, annotations)
+	if err != nil {
+		t.Fatalf("pack 1: %v", err)
+	}
+	d2, err := wc.packStateManifestAnnotated(ctx, []ocispec.Descriptor{layerDesc}, annotations)
+	if err != nil {
+		t.Fatalf("pack 2: %v", err)
+	}
+	if d1.Digest != d2.Digest {
+		t.Fatalf("digests differ across identical packs: %s vs %s", d1.Digest, d2.Digest)
+	}
+}
+
+// TestPut_HistoryPreparationFailureLeavesCurrentUntouched — H is prepared
+// before any mutable tag is published: a history-pack failure returns an
+// error and leaves the current tag exactly as it was.
+func TestPut_HistoryPreparationFailureLeavesCurrentUntouched(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	hook := &historyPackFailRepo{delegatingRepo: delegatingRepo{inner: fake}}
+	repo := &orasRepositoryClient{inner: hook, repository: "example.com/test/repo"}
+	c := newTestClient(repo)
+	c.config.MaxVersions = 3
+	wc := newRemoteClient(repo, "default")
+
+	if err := c.Put(ctx, "default", []byte("state-v1")); !errors.Is(err, errHistoryPackFailed) {
+		t.Fatalf("Put error = %v, want the history-preparation sentinel", err)
+	}
+	if _, err := fake.Resolve(ctx, wc.stateTag); !errors.Is(err, errdef.ErrNotFound) {
+		t.Errorf("state tag resolve err = %v, want absent (H preparation failure must leave current untouched)", err)
+	}
+}
+
+// TestRetention_DeletesOnlyVerifiedHistoryDigests — deterministic public
+// schedule: with MaxVersions=1, the second Put's retention deletes exactly
+// the verified history manifest of v1 and NEVER a current manifest digest;
+// current state and retained history stay readable.
+func TestRetention_DeletesOnlyVerifiedHistoryDigests(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	track := &deleteTrackingRepo{delegatingRepo: delegatingRepo{inner: fake}}
+	repo := &orasRepositoryClient{inner: track, repository: "example.com/test/repo"}
+	c := newTestClient(repo)
+	c.config.MaxVersions = 1
+	wc := newRemoteClient(repo, "default")
+
+	if err := c.Put(ctx, "default", []byte("v1")); err != nil {
+		t.Fatalf("put v1: %v", err)
+	}
+	c.WaitForRetention()
+	currentV1 := mustResolve(ctx, t, fake, wc.stateTag)
+	// Capture the history digest now: after the second Put, its async
+	// retention may already have deleted this tag.
+	historyV1 := mustResolve(ctx, t, fake, wc.versionTagFor(1))
+
+	if err := c.Put(ctx, "default", []byte("v2")); err != nil {
+		t.Fatalf("put v2: %v", err)
+	}
+	currentV2 := mustResolve(ctx, t, fake, wc.stateTag)
+	if currentV1.Digest == historyV1.Digest || currentV2.Digest == historyV1.Digest {
+		t.Fatal("test setup: current and history digests must differ")
+	}
+	c.WaitForRetention()
+
+	// Retention ran to completion: exactly one delete, of the verified
+	// history digest, never a current manifest digest.
+	if len(track.deleted) != 1 || track.deleted[0] != historyV1.Digest {
+		t.Fatalf("deleted digests = %v, want exactly [%s]", track.deleted, historyV1.Digest)
+	}
+	for name, d := range map[string]digest.Digest{"current v1": currentV1.Digest, "current v2": currentV2.Digest} {
+		if _, ok := fake.blobs[d]; !ok {
+			t.Errorf("%s manifest blob was deleted; retention must never delete a current manifest digest", name)
+		}
+	}
+
+	// Current state and retained history remain intact.
+	if got, err := c.Get(ctx, "default"); err != nil || string(got) != "v2" {
+		t.Errorf("Get = (%q, %v), want %q", got, err, "v2")
+	}
+	if got, err := c.GetVersion(ctx, "default", 2); err != nil || string(got) != "v2" {
+		t.Errorf("GetVersion(2) = (%q, %v), want %q", got, err, "v2")
+	}
+	if _, err := c.GetVersion(ctx, "default", 1); !errors.Is(err, ErrStateVersionNotFound) {
+		t.Errorf("GetVersion(1) = %v, want ErrStateVersionNotFound", err)
+	}
+}
+
+// TestRetention_PreservesLegacyUnmarkedAndSharedAliases — retention deletes
+// ONLY exact verified history manifests: unmarked legacy manifests, unknown
+// artifact types, and marked-but-untyped manifests are preserved; a digest
+// group shared between a retired and a retained version tag (ambiguous alias
+// group) is preserved wholesale; no retagging occurs. The current manifest
+// digest is never a deletion candidate.
+func TestRetention_PreservesLegacyUnmarkedAndSharedAliases(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	track := &deleteTrackingRepo{delegatingRepo: delegatingRepo{inner: fake}}
+	repo := &orasRepositoryClient{inner: track, repository: "example.com/test/repo"}
+	// enforceVersionRetention reads the config of wc's own client.
+	wc := newRemoteClient(repo, "default")
+	wc.client.config.MaxVersions = 2
+
+	// Versions [1..7] with MaxVersions=2: delete set {1,2,3,4,5}, keep {6,7}.
+	// v1: legacy unmarked manifest (old writers published one manifest for
+	// current and history).
+	v1Desc := seedVersionManifest(ctx, t, fake, wc, 1, "legacy-v1", false, artifactTypeState)
+	// v2: recognized marker but foreign artifact type.
+	v2Desc := seedVersionManifest(ctx, t, fake, wc, 2, "foreign-v2", true, "application/vnd.foreign")
+	// v3: recognized marker but UNTYPED manifest — not a verifiable history
+	// manifest, so it must be preserved.
+	v3Desc := seedVersionManifest(ctx, t, fake, wc, 3, "untyped-v3", true, "")
+	// v4: exact verified history manifest — the only deletion candidate.
+	v4Desc := seedVersionManifest(ctx, t, fake, wc, 4, "marked-v4", true, artifactTypeState)
+	// v5+v6: one manifest aliased under a retired (v5) and a retained (v6)
+	// version tag — an ambiguous alias group.
+	sharedDesc := seedVersionManifest(ctx, t, fake, wc, 5, "shared-v5", true, artifactTypeState)
+	if err := fake.Tag(ctx, sharedDesc, wc.versionTagFor(6)); err != nil {
+		t.Fatalf("tag shared alias v6: %v", err)
+	}
+	// v7: exact verified history manifest, but in the RETAINED set.
+	seedVersionManifest(ctx, t, fake, wc, 7, "marked-v7", true, artifactTypeState)
+
+	current := ocispec.Descriptor{Digest: digest.Digest("sha256:" + strings.Repeat("0", 64))}
+	if err := wc.enforceVersionRetention(ctx, current, []int{1, 2, 3, 4, 5, 6, 7}); err != nil {
+		t.Fatalf("enforceVersionRetention: %v", err)
+	}
+
+	if len(track.deleted) != 1 || track.deleted[0] != v4Desc.Digest {
+		t.Fatalf("deleted digests = %v, want exactly [%s]", track.deleted, v4Desc.Digest)
+	}
+	// The verified history candidate is gone by exact digest; everything
+	// else — unmarked, unknown, marked-but-untyped, shared aliases,
+	// retained — is preserved.
+	if _, err := fake.Resolve(ctx, wc.versionTagFor(4)); !errors.Is(err, errdef.ErrNotFound) {
+		t.Errorf("verified history v4 still present, want deleted by exact digest")
+	}
+	for _, tc := range []struct {
+		version int
+		want    digest.Digest
+	}{{1, v1Desc.Digest}, {2, v2Desc.Digest}, {3, v3Desc.Digest}, {5, sharedDesc.Digest}, {6, sharedDesc.Digest}} {
+		got, err := fake.Resolve(ctx, wc.versionTagFor(tc.version))
+		if err != nil {
+			t.Errorf("version tag v%d was removed; unmarked/unknown/untyped/shared manifests must be preserved: %v", tc.version, err)
+			continue
+		}
+		if got.Digest != tc.want {
+			t.Errorf("version tag v%d = %s, want preserved digest %s", tc.version, got.Digest, tc.want)
+		}
+	}
+	// The retained verified history manifest is untouched.
+	if _, err := fake.Resolve(ctx, wc.versionTagFor(7)); err != nil {
+		t.Errorf("retained history v7 must survive retention: %v", err)
+	}
+	if track.tagCalls != 0 {
+		t.Errorf("Tag calls during retention = %d, want 0 (no retagging)", track.tagCalls)
+	}
+}
+
+// retentionGateRepo gates the Delete of a specific digest (the old verified
+// history manifest) after retention's final descriptor validation, giving
+// the test a deterministic window; everything else delegates.
+type retentionGateRepo struct {
+	delegatingRepo
+	gateDigest digest.Digest
+	paused     chan struct{}
+	release    chan struct{}
+
+	mu       sync.Mutex
+	gatedOne bool
+}
+
+func (r *retentionGateRepo) Delete(ctx context.Context, target ocispec.Descriptor) error {
+	r.mu.Lock()
+	match := target.Digest == r.gateDigest && !r.gatedOne
+	if match {
+		r.gatedOne = true
+	}
+	r.mu.Unlock()
+	if match {
+		close(r.paused)
+		select {
+		case <-r.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return r.delegatingRepo.Delete(ctx, target)
+}
+
+// TestRetention_DelayedWriterInterleavingKeepsCurrentReadable — deterministic
+// interleaving: retention's delete of an old verified history manifest is
+// gated AFTER final descriptor validation; while paused, a delayed writer
+// publishes that state's distinct C manifest back under the state tag; after
+// release, the state tag still resolves and Get still reads the current
+// bytes — the exact-digest delete never touched the current manifest.
+func TestRetention_DelayedWriterInterleavingKeepsCurrentReadable(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	gate := &retentionGateRepo{delegatingRepo: delegatingRepo{inner: fake}, paused: make(chan struct{}), release: make(chan struct{})}
+	repo := &orasRepositoryClient{inner: gate, repository: "example.com/test/repo"}
+	c := newTestClient(repo)
+	c.config.MaxVersions = 1
+	wc := newRemoteClient(repo, "default")
+
+	if err := c.Put(ctx, "default", []byte("v1")); err != nil {
+		t.Fatalf("put v1: %v", err)
+	}
+	c.WaitForRetention()
+	currentV1 := mustResolve(ctx, t, fake, wc.stateTag)
+	historyV1 := mustResolve(ctx, t, fake, wc.versionTagFor(1))
+	if currentV1.Digest == historyV1.Digest {
+		t.Fatal("test setup: current and history digests must be distinct")
+	}
+	// Arm the gate on the old verified history digest before the second Put
+	// schedules its retention goroutine.
+	gate.mu.Lock()
+	gate.gateDigest = historyV1.Digest
+	gate.mu.Unlock()
+
+	if err := c.Put(ctx, "default", []byte("v2")); err != nil {
+		t.Fatalf("put v2: %v", err)
+	}
+	historyV2 := mustResolve(ctx, t, fake, wc.versionTagFor(2))
+
+	// Wait for retention to reach the gated delete (after it validated the
+	// history descriptor), then run the delayed writer: republish v1's
+	// distinct C manifest under the state tag.
+	select {
+	case <-gate.paused:
+	case <-time.After(testObservationTimeout):
+		t.Fatal("timed out waiting for retention to reach the gated delete")
+	}
+	if err := fake.Tag(ctx, currentV1, wc.stateTag); err != nil {
+		t.Fatalf("delayed writer republish: %v", err)
+	}
+	close(gate.release)
+
+	// Deterministic barrier: retention finished before assertions.
+	c.WaitForRetention()
+
+	// The state tag resolves to the delayed writer's manifest and Get still
+	// reads the current bytes.
+	got, err := fake.Resolve(ctx, wc.stateTag)
+	if err != nil || got.Digest != currentV1.Digest {
+		t.Errorf("state tag = (%v, %v), want the delayed writer's current manifest %s", got.Digest, err, currentV1.Digest)
+	}
+	if data, gerr := c.Get(ctx, "default"); gerr != nil || string(data) != "v1" {
+		t.Errorf("Get = (%q, %v), want the current bytes %q", data, gerr, "v1")
+	}
+	// The old history was still retired; the retained history is intact.
+	if _, rerr := fake.Resolve(ctx, wc.versionTagFor(1)); !errors.Is(rerr, errdef.ErrNotFound) {
+		t.Errorf("old history v1 resolve err = %v, want deleted by exact digest", rerr)
+	}
+	if gotV2, rerr := fake.Resolve(ctx, wc.versionTagFor(2)); rerr != nil || gotV2.Digest != historyV2.Digest {
+		t.Errorf("retained history v2 = (%v, %v), want %s", gotV2.Digest, rerr, historyV2.Digest)
+	}
+}
+
+// TestRetention_IncompatibleAliasGroupNeverDeleted — deterministic regardless
+// of map iteration: MaxVersions=1 over versions [1,2,3]; v1 and v2 are
+// aliased to ONE history manifest marked v1. The marker agrees with v1 but
+// not with v2, so the alias group is logically incompatible and the WHOLE
+// digest group is preserved — nothing is deleted for it.
+func TestRetention_IncompatibleAliasGroupNeverDeleted(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	track := &deleteTrackingRepo{delegatingRepo: delegatingRepo{inner: fake}}
+	repo := &orasRepositoryClient{inner: track, repository: "example.com/test/repo"}
+	wc := newRemoteClient(repo, "default")
+	wc.client.config.MaxVersions = 1
+
+	// One H manifest marked v1, aliased under BOTH stver-v1 and stver-v2.
+	aliased := seedVersionManifest(ctx, t, fake, wc, 1, "aliased-v1", true, artifactTypeState)
+	if err := fake.Tag(ctx, aliased, wc.versionTagFor(2)); err != nil {
+		t.Fatalf("tag alias v2: %v", err)
+	}
+	// v3: verified marked history, in the RETAINED set.
+	v3Desc := seedVersionManifest(ctx, t, fake, wc, 3, "marked-v3", true, artifactTypeState)
+
+	current := ocispec.Descriptor{Digest: digest.Digest("sha256:" + strings.Repeat("0", 64))}
+	if err := wc.enforceVersionRetention(ctx, current, []int{1, 2, 3}); err != nil {
+		t.Fatalf("enforceVersionRetention: %v", err)
+	}
+
+	if len(track.deleted) != 0 {
+		t.Fatalf("deleted digests = %v, want none (marker v1 disagrees with alias v2; the whole group must be preserved)", track.deleted)
+	}
+	for _, v := range []int{1, 2, 3} {
+		want := map[int]digest.Digest{1: aliased.Digest, 2: aliased.Digest, 3: v3Desc.Digest}[v]
+		if got, err := fake.Resolve(ctx, wc.versionTagFor(v)); err != nil || got.Digest != want {
+			t.Errorf("version tag v%d = (%v, %v), want preserved digest %s", v, got.Digest, err, want)
+		}
+	}
+}
+
+// tagMoveTrackingRepo combines the delayed-writer double for retention: it
+// moves the watched version tag to another descriptor immediately after the
+// FIRST resolve observes it (a concurrent writer landing between retention's
+// grouping and its validation), records every deleted digest, and counts Tag
+// calls; everything else delegates.
+type tagMoveTrackingRepo struct {
+	delegatingRepo
+	watch     string
+	movedDesc ocispec.Descriptor
+
+	mu       sync.Mutex
+	resolves int
+	deleted  []digest.Digest
+	tagCalls int
+}
+
+func (r *tagMoveTrackingRepo) Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error) {
+	desc, err := r.delegatingRepo.Resolve(ctx, reference)
+	if err != nil || reference != r.watch {
+		return desc, err
+	}
+	r.mu.Lock()
+	r.resolves++
+	first := r.resolves == 1
+	r.mu.Unlock()
+	if first {
+		if terr := r.delegatingRepo.Tag(ctx, r.movedDesc, r.watch); terr != nil {
+			return ocispec.Descriptor{}, terr
+		}
+	}
+	return desc, err
+}
+
+func (r *tagMoveTrackingRepo) Tag(ctx context.Context, desc ocispec.Descriptor, reference string) error {
+	r.mu.Lock()
+	r.tagCalls++
+	r.mu.Unlock()
+	return r.delegatingRepo.Tag(ctx, desc, reference)
+}
+
+func (r *tagMoveTrackingRepo) Delete(ctx context.Context, target ocispec.Descriptor) error {
+	r.mu.Lock()
+	r.deleted = append(r.deleted, target.Digest)
+	r.mu.Unlock()
+	return r.delegatingRepo.Delete(ctx, target)
+}
+
+// TestRetention_TagMovedAfterGroupingDeletesGroupedDigestOnly — regression:
+// the version tag moves to another (valid, verified) descriptor right after
+// retention's grouping resolve. Retention must fetch and delete ONLY the
+// grouped digest it validated and never the tag's new target.
+func TestRetention_TagMovedAfterGroupingDeletesGroupedDigestOnly(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	move := &tagMoveTrackingRepo{delegatingRepo: delegatingRepo{inner: fake}}
+	repo := &orasRepositoryClient{inner: move, repository: "example.com/test/repo"}
+	wc := newRemoteClient(repo, "default")
+	wc.client.config.MaxVersions = 1
+
+	// v1: the grouped verified H; seeding tags stver-v1 at it.
+	oldH := seedVersionManifest(ctx, t, fake, wc, 1, "old-h1", true, artifactTypeState)
+	// The moving writer publishes ANOTHER verified H for v1, which the tag
+	// will point at after the move.
+	newH := seedVersionManifest(ctx, t, fake, wc, 1, "new-h1", true, artifactTypeState)
+	if err := fake.Tag(ctx, oldH, wc.versionTagFor(1)); err != nil {
+		t.Fatalf("restore v1 tag: %v", err)
+	}
+	// v2: verified marked history, in the RETAINED set.
+	v2Desc := seedVersionManifest(ctx, t, fake, wc, 2, "marked-v2", true, artifactTypeState)
+
+	move.mu.Lock()
+	move.watch = wc.versionTagFor(1)
+	move.movedDesc = newH
+	move.mu.Unlock()
+
+	current := ocispec.Descriptor{Digest: digest.Digest("sha256:" + strings.Repeat("0", 64))}
+	if err := wc.enforceVersionRetention(ctx, current, []int{1, 2}); err != nil {
+		t.Fatalf("enforceVersionRetention: %v", err)
+	}
+
+	if len(move.deleted) != 1 || move.deleted[0] != oldH.Digest {
+		t.Fatalf("deleted digests = %v, want exactly [%s] (the grouped digest; the moved tag's target must never be deleted)", move.deleted, oldH.Digest)
+	}
+	// The moved-to manifest is intact and still owns the tag.
+	if _, ok := fake.blobs[newH.Digest]; !ok {
+		t.Error("moved-to manifest blob was deleted; retention must fetch/delete only the grouped digest")
+	}
+	if got, err := fake.Resolve(ctx, wc.versionTagFor(1)); err != nil || got.Digest != newH.Digest {
+		t.Errorf("version tag v1 = (%v, %v), want the new target %s", got.Digest, err, newH.Digest)
+	}
+	// The grouped digest itself was deleted; the retained version survives.
+	if _, ok := fake.blobs[oldH.Digest]; ok {
+		t.Error("grouped digest blob still present, want deleted")
+	}
+	if got, err := fake.Resolve(ctx, wc.versionTagFor(2)); err != nil || got.Digest != v2Desc.Digest {
+		t.Errorf("retained v2 = (%v, %v), want %s", got.Digest, err, v2Desc.Digest)
+	}
+	if move.tagCalls != 0 {
+		t.Errorf("Tag calls during retention = %d, want 0 (no retagging)", move.tagCalls)
+	}
+}
+
+// TestGHCR_AutomaticRetentionDisabledHistoryReadable — automatic retention is
+// disabled for ghcr.io: with MaxVersions=1 and multiple Puts, history is
+// still published and readable and current is intact, with ZERO automatic
+// retention Delete calls (the Packages-API fallback only runs from a Delete,
+// so zero deletes also means zero Packages calls). No live registry test.
+func TestGHCR_AutomaticRetentionDisabledHistoryReadable(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	ops := &countingOpsRepo{delegatingRepo: delegatingRepo{inner: fake}}
+	c := newTestClient(&orasRepositoryClient{inner: ops, repository: "ghcr.io/owner/repo"})
+	c.config.MaxVersions = 1
+
+	if err := c.Put(ctx, "default", []byte("ghcr-v1")); err != nil {
+		t.Fatalf("put v1: %v", err)
+	}
+	_, deletesAfterV1 := ops.counts()
+	if err := c.Put(ctx, "default", []byte("ghcr-v2")); err != nil {
+		t.Fatalf("put v2: %v", err)
+	}
+	tagsAfterPuts, deletesAfterPuts := ops.counts()
+	c.WaitForRetention()
+
+	tags, deletes := ops.counts()
+	if deletes != 0 || deletesAfterV1 != 0 || deletesAfterPuts != 0 {
+		t.Errorf("Delete calls = %d (v1: %d, after v2: %d), want 0 (no automatic retention on ghcr.io)", deletes, deletesAfterV1, deletesAfterPuts)
+	}
+	if tags != tagsAfterPuts || tags != 4 {
+		t.Errorf("Tag calls = %d (right after publications: %d), want exactly 4 publication tags (2 per Put) and no retention tag cleanup", tags, tagsAfterPuts)
+	}
+
+	// History is still published and readable; current is intact.
+	if got, err := c.Get(ctx, "default"); err != nil || string(got) != "ghcr-v2" {
+		t.Errorf("Get = (%q, %v), want %q", got, err, "ghcr-v2")
+	}
+	if got, err := c.GetVersion(ctx, "default", 1); err != nil || string(got) != "ghcr-v1" {
+		t.Errorf("GetVersion(1) = (%q, %v), want %q (history must not be disabled on ghcr.io)", got, err, "ghcr-v1")
+	}
+	if got, err := c.GetVersion(ctx, "default", 2); err != nil || string(got) != "ghcr-v2" {
+		t.Errorf("GetVersion(2) = (%q, %v), want %q", got, err, "ghcr-v2")
+	}
+}
 
 // ─── (1) Get / GetVersion: incomplete state is not "absent" ──────────────────
 

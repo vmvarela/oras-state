@@ -743,55 +743,6 @@ func TestRemoteClient_Put_VersioningTagsAndRetention(t *testing.T) {
 	}
 }
 
-func TestRemoteClient_RetagToNewManifest_PreservesVersionAnnotation(t *testing.T) {
-	ctx := context.Background()
-	fake := newFakeORASRepo()
-	repo := &orasRepositoryClient{inner: fake}
-	client := &Client{
-		repoClient: repo,
-		config: Config{
-			MaxVersions: 3,
-		},
-		retentionSem: make(chan struct{}, 3),
-	}
-	c := &workspaceClient{
-		client:         client,
-		stateID:        "default",
-		stateTag:       stateTagPrefix + "default",
-		versionTagBase: stateVersionTagPrefix + "default",
-		lockTag:        lockTagPrefix + "default",
-		unlockedTag:    unlockedTagPrefix + "default",
-	}
-
-	if err := c.put(ctx, []byte("state-data")); err != nil {
-		t.Fatalf("put: %v", err)
-	}
-	c.client.retentionWg.Wait()
-
-	// Fetch the current manifest to check its version annotation.
-	fm, _, err := c.fetchManifestWithDesc(ctx, c.stateTag)
-	if err != nil {
-		t.Fatalf("fetchManifestWithDesc: %v", err)
-	}
-	originalVersion := fm.Annotations[annotationStateVersion]
-
-	// Retag to a new manifest (simulating retention detach).
-	if err := c.retagToNewManifest(ctx, []string{c.stateTag}); err != nil {
-		t.Fatalf("retagToNewManifest: %v", err)
-	}
-	c.client.retentionWg.Wait()
-
-	// Re-fetch and verify the version annotation is preserved.
-	fm2, _, err := c.fetchManifestWithDesc(ctx, c.stateTag)
-	if err != nil {
-		t.Fatalf("fetchManifestWithDesc after retag: %v", err)
-	}
-	if fm2.Annotations[annotationStateVersion] != originalVersion {
-		t.Errorf("version annotation after retag = %q, want %q",
-			fm2.Annotations[annotationStateVersion], originalVersion)
-	}
-}
-
 func TestAsyncRetentionNotBlocking(t *testing.T) {
 	// Verify that async retention is truly async and doesn't block put.
 	ctx := context.Background()

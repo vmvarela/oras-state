@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"slices"
@@ -42,10 +43,17 @@ const (
 	annotationWorkspace    = "org.terraform.workspace"
 	annotationUpdatedAt    = "org.terraform.state.updated_at"
 	annotationStateVersion = "org.terraform.state.version"
+	annotationStateHistory = "org.terraform.state.history"
 	annotationLockID       = "org.terraform.lock.id"
 	annotationLockInfo     = "org.terraform.lock.info"
 	annotationLockGen      = "org.terraform.lock.generation"
 )
+
+// annotationCreated is the OCI image-spec created timestamp. PackManifest
+// stamps the wall clock when it is absent, which would make every pack of
+// the same logical publication produce a different digest; puts fix it to a
+// single value per logical Put so packing is reproducible.
+const annotationCreated = ocispec.AnnotationCreated
 
 // defaultMaxStateSize is the default upper bound on state data read from the
 // registry. It guards against OOM caused by a maliciously large or corrupted
@@ -142,14 +150,20 @@ func (e *LockError) Unwrap() error { return e.Err }
 // for the state tag refuse the write and ask for a fresh lock.
 var ErrMutableTagMoved = errors.New("mutable OCI tag moved or ambiguous")
 
-// PartialPublicationError reports a PARTIAL publication: the state manifest
-// was published successfully (StateTag is visible and ours), but a
-// subsequent mutable tag of the same publication — currently the version tag
-// — failed or conflicted (Err carries the underlying failure, possibly
-// wrapping ErrMutableTagMoved). The state write is NOT wholly rejected: the
-// state is readable. This is deliberately typed (not a sentinel) so callers
-// can inspect which tag succeeded and which failed; false failure is
-// preferred over silently overwriting the version tag, so no retry is made.
+// PartialPublicationError reports a PARTIAL publication: the current-state
+// manifest (C) was published under StateTag during this Put — verified ours
+// at publication time — but the subsequent mutable tag of the same
+// publication (currently the history/version tag) failed or conflicted (Err
+// carries the underlying failure, possibly wrapping ErrMutableTagMoved).
+// There is no rollback. The state write is NOT wholly rejected: the state
+// was readable at publication time. However, OCI tags are last-writer-wins
+// with no CAS, so by the time the caller observes this error StateTag may
+// have been superseded by a later writer — the error guarantees only that
+// THIS publication succeeded under the tag, not that the tag still holds it
+// or is still current when observed. This is deliberately typed (not a
+// sentinel) so callers can inspect which tag succeeded and which failed;
+// false failure is preferred over silently overwriting the version tag, so
+// no retry is made.
 type PartialPublicationError struct {
 	// StateTag is the mutable tag that published successfully.
 	StateTag string
@@ -406,22 +420,46 @@ func (wc *workspaceClient) put(ctx context.Context, state []byte) error {
 		return err
 	}
 
-	// Manifest annotations are computed ONCE so every push attempt of the
-	// same publication has identical bytes — and therefore one stable digest.
-	// (packStateManifest stamps a fresh updated_at per call and is kept for
-	// the retention retag path, which wants exactly that.)
+	// Manifest annotations are computed ONCE per logical Put so every push
+	// attempt has identical bytes — and therefore one stable digest. created
+	// is fixed to the same single RFC3339 value: PackManifest stamps the
+	// wall clock when the annotation is absent, which would make each pack
+	// of the same logical publication produce a different digest.
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	annotations := map[string]string{
 		annotationWorkspace: wc.stateID,
-		annotationUpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		annotationUpdatedAt: now,
+		annotationCreated:   now,
 	}
 	if nextVersion > 0 {
 		annotations[annotationStateVersion] = strconv.Itoa(nextVersion)
 	}
+	// C: the current manifest, published under the state tag. It carries NO
+	// history marker.
 	manifestDesc, err := retryWithResult(ctx, func(ctx context.Context) (ocispec.Descriptor, error) {
 		return wc.packStateManifestAnnotated(ctx, []ocispec.Descriptor{layerDesc}, annotations)
 	})
 	if err != nil {
 		return err
+	}
+
+	// H: the distinct history manifest for the version tag, PREPARED (layer
+	// and both manifests pushed, content-addressed) before current is
+	// published — a history-pack failure leaves the current tag untouched.
+	// The dedicated history marker guarantees C and H digests differ even
+	// when layer, bytes and timestamps are identical, and lets retention
+	// prove a candidate manifest is history before deleting it.
+	var historyDesc ocispec.Descriptor
+	if wc.client.config.MaxVersions > 0 {
+		historyAnnotations := make(map[string]string, len(annotations)+1)
+		maps.Copy(historyAnnotations, annotations)
+		historyAnnotations[annotationStateHistory] = strconv.Itoa(nextVersion)
+		historyDesc, err = retryWithResult(ctx, func(ctx context.Context) (ocispec.Descriptor, error) {
+			return wc.packStateManifestAnnotated(ctx, []ocispec.Descriptor{layerDesc}, historyAnnotations)
+		})
+		if err != nil {
+			return err
+		}
 	}
 
 	if err := wc.publishMutableTag(ctx, manifestDesc, wc.stateTag); err != nil {
@@ -433,16 +471,27 @@ func (wc *workspaceClient) put(ctx context.Context, state []byte) error {
 	}
 
 	newVersionTag := wc.versionTagFor(nextVersion)
-	if err := wc.publishMutableTag(ctx, manifestDesc, newVersionTag); err != nil {
-		// The state tag is already published and ours: report the failure as
-		// PARTIAL (state visible, version publication failed) instead of a
-		// whole-write rejection. The failed version tag is never re-applied
+	if err := wc.publishMutableTag(ctx, historyDesc, newVersionTag); err != nil {
+		// The state tag was published and verified ours at publication time
+		// (it may be superseded by a later writer by the time the caller
+		// observes this): report the failure as PARTIAL (state was visible,
+		// history publication failed) instead of a whole-write rejection.
+		// There is no rollback: the failed version tag is never re-applied
 		// or deleted (false-failure preference: it may belong to a rival).
 		return &PartialPublicationError{
 			StateTag:   wc.stateTag,
 			VersionTag: newVersionTag,
 			Err:        err,
 		}
+	}
+
+	// Automatic retention is disabled for ghcr.io (ghcrRegistry): no
+	// automatic Delete, Packages-API fallback or tag cleanup is issued
+	// there. History is still published and readable; the consequence is
+	// that MaxVersions does not bound history on ghcr.io (it can grow
+	// unbounded). Explicit Delete/DeleteWorkspace are unaffected.
+	if wc.client.ghcrRegistry() {
+		return nil
 	}
 
 	// Async retention: limits concurrent goroutines via semaphore.
@@ -913,8 +962,7 @@ const tagPrePushNotFoundRetryDelay = 100 * time.Millisecond
 // immediately — including a tag PUT that failed with an HTTP 404
 // ErrorResponse, which is a remote errcode.ErrorResponse, NOT
 // errdef.ErrNotFound — and transient PUT failures keep their existing
-// per-callsite handling (observation in publishMutableTag; retagToNewManifest
-// surfaces non-sentinel errors as before).
+// per-callsite handling (observation in publishMutableTag).
 func tagPrePushNotFoundRetry(ctx context.Context, repo orasRepository, desc ocispec.Descriptor, reference string) error {
 	for attempt := 1; ; attempt++ {
 		err := repo.Tag(ctx, desc, reference)
@@ -1095,6 +1143,9 @@ func (c *Client) WaitForRetention() {
 
 // ─── workspaceClient helpers ──────────────────────────────────────────────────
 
+// packStateManifest packs a state manifest with a fresh updated_at stamp.
+// Not used by publications (put fixes created/updated_at per logical Put for
+// reproducibility); kept for tests that craft manifests by hand.
 func (wc *workspaceClient) packStateManifest(ctx context.Context, layers []ocispec.Descriptor, stateVersion int) (ocispec.Descriptor, error) {
 	annotations := map[string]string{
 		annotationWorkspace: wc.stateID,
@@ -1222,12 +1273,25 @@ func (wc *workspaceClient) listExistingVersions(ctx context.Context) ([]int, err
 //
 //	version numbers for this workspace.
 //
-// Post: at most wc.client.config.MaxVersions versions remain in the registry;
+// Post: at most wc.client.config.MaxVersions versions remain, counting only
 //
-//	the current manifest (identified by current.Digest) is never deleted.
+//	exact verified history manifests. The current manifest (current.Digest)
+//	is never deleted.
 //
-// Loop invariant (over groups): each group processed has its keep-tagged
-// manifests retagged to a new digest before the old digest is deleted.
+// Deletion safety: a digest group is deleted only when (a) every alias tag
+// in the group is being retired — a group shared with a retained tag is
+// preserved, because OCI delete-by-digest removes ALL aliases to the exact
+// manifest (the spec does not promise shared blob GC semantics) — and (b)
+// the manifest fetched BY THE GROUPED DESCRIPTOR is an exact verified
+// history manifest whose marker/version agrees with EVERY version tag in
+// the group (workspace ownership is enforced by the fetch; any logically
+// incompatible alias preserves the whole group). Unmarked or unrecognized
+// manifests — legacy writers, foreign formats — are preserved. The grouped
+// descriptor is what gets deleted and no mutable tag is ever resolved
+// again after grouping: a re-resolve could return a different manifest and
+// delete the wrong one. No retagging exists in this protocol: current and
+// history manifests have distinct digests, so retiring history never
+// detaches the current tag.
 // Bounding function: len(groups) - index of processed group.
 func (wc *workspaceClient) enforceVersionRetention(ctx context.Context, current ocispec.Descriptor, versions []int) error {
 	if wc.client.config.MaxVersions <= 0 || len(versions) <= wc.client.config.MaxVersions {
@@ -1252,20 +1316,31 @@ func (wc *workspaceClient) enforceVersionRetention(ctx context.Context, current 
 	if err != nil {
 		return err
 	}
-	if len(groups) == 0 {
-		return nil
-	}
 
 	for _, g := range groups {
 		tagsToDelete, tagsToKeep := classifyTags(g.tags, deleteTagSet, keepTagSet)
 		if len(tagsToDelete) == 0 {
 			continue
 		}
-
 		if len(tagsToKeep) > 0 {
-			if err := wc.retagToNewManifest(ctx, tagsToKeep); err != nil {
-				return err
-			}
+			// Ambiguous alias group: the digest is shared with a retained
+			// tag; deleting it would remove the retained alias too.
+			continue
+		}
+
+		// Final validation fetches the EXACT grouped descriptor — it never
+		// re-resolves a mutable version tag, which may have moved since
+		// grouping and must never become a deletion target.
+		fm, err := wc.fetchManifestByDesc(ctx, g.desc)
+		if isNotFound(err) {
+			// A concurrent retention may have deleted it already.
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !isVerifiedHistoryGroup(&fm, g.tags) {
+			continue
 		}
 
 		if err := wc.deleteDigestWithFallback(ctx, g.desc, tagsToDelete[0]); err != nil {
@@ -1274,6 +1349,49 @@ func (wc *workspaceClient) enforceVersionRetention(ctx context.Context, current 
 	}
 
 	return nil
+}
+
+// isVerifiedHistoryGroup reports whether the validated manifest m is an
+// exact, recognized history manifest for EVERY version tag aliased to its
+// digest group: each tag's version must be recognized and agree with m's
+// marker (and version annotation). Any logically incompatible alias
+// preserves the whole digest group — deletion by digest removes all aliases.
+func isVerifiedHistoryGroup(m *ocispec.Manifest, tags []string) bool {
+	for _, tag := range tags {
+		_, version, ok := splitStateVersionTag(tag)
+		if !ok || !isVerifiedHistoryManifest(m, version) {
+			return false
+		}
+	}
+	return true
+}
+
+// isVerifiedHistoryManifest reports whether m is an exact, recognized history
+// manifest for version: exactly the state artifact type (untyped manifests
+// are NOT eligible — new H manifests always carry the type; legacy readers
+// remain lenient), a dedicated history marker whose value equals the
+// version, and (when present) a version annotation that agrees with it.
+// Unmarked or unrecognized manifests — legacy writers, foreign formats,
+// ambiguous markers — are never eligible for automatic deletion.
+func isVerifiedHistoryManifest(m *ocispec.Manifest, version int) bool {
+	if m.ArtifactType != artifactTypeState {
+		return false
+	}
+	raw, ok := m.Annotations[annotationStateHistory]
+	if !ok {
+		return false
+	}
+	marked, err := strconv.Atoi(raw)
+	if err != nil || marked != version {
+		return false
+	}
+	if rawVersion, ok := m.Annotations[annotationStateVersion]; ok {
+		annotated, err := strconv.Atoi(rawVersion)
+		if err != nil || annotated != version {
+			return false
+		}
+	}
+	return true
 }
 
 func (wc *workspaceClient) groupVersionsByDigest(ctx context.Context, versions []int, currentDigest string) (map[string]*digestGroup, error) {
@@ -1334,37 +1452,12 @@ func classifyTags(tags []string, deleteSet, keepSet map[string]struct{}) (toDele
 	return
 }
 
-func (wc *workspaceClient) retagToNewManifest(ctx context.Context, tags []string) error {
-	if len(tags) == 0 {
-		return nil
-	}
-	slog.Debug("retention: detaching keep tags from digest", "tags", tags)
-
-	fm, _, err := wc.fetchManifestWithDesc(ctx, tags[0])
-	if err != nil {
-		return err
-	}
-	if len(fm.Layers) == 0 {
-		return nil
-	}
-
-	preservedVersion := 0
-	if v, ok := fm.Annotations[annotationStateVersion]; ok {
-		if n, parseErr := strconv.Atoi(v); parseErr == nil && n > 0 {
-			preservedVersion = n
-		}
-	}
-
-	newDesc, err := wc.packStateManifest(ctx, fm.Layers, preservedVersion)
-	if err != nil {
-		return err
-	}
-	for _, tag := range tags {
-		if err := tagPrePushNotFoundRetry(ctx, wc.client.repoClient.inner, newDesc, tag); err != nil {
-			return err
-		}
-	}
-	return nil
+// ghcrRegistry reports whether the configured registry is ghcr.io. Automatic
+// retention is disabled there: manifest deletion returns HTTP 405 and the
+// Packages-API fallback is reserved for explicit Delete/DeleteWorkspace.
+func (c *Client) ghcrRegistry() bool {
+	host, _, _, err := parseGHCRRepository(c.repoClient.repository)
+	return err == nil && host == ghcrHost
 }
 
 func (wc *workspaceClient) deleteDigestWithFallback(ctx context.Context, desc ocispec.Descriptor, fallbackTag string) error {
@@ -1493,31 +1586,43 @@ func (wc *workspaceClient) fetchManifestInternal(ctx context.Context, reference 
 	if err != nil {
 		return ocispec.Manifest{}, ocispec.Descriptor{}, err
 	}
-	rc, err := wc.client.repoClient.inner.Fetch(ctx, desc)
+	m, err := wc.fetchManifestByDesc(ctx, desc)
 	if err != nil {
 		if isNotFound(err) {
 			return ocispec.Manifest{}, ocispec.Descriptor{}, &missingContentError{fmt.Errorf("manifest %s for %q: %w", desc.Digest, reference, err)}
 		}
 		return ocispec.Manifest{}, ocispec.Descriptor{}, err
 	}
+	return m, desc, nil
+}
+
+// fetchManifestByDesc fetches and parses the manifest identified by an
+// ALREADY-RESOLVED descriptor — it never resolves a mutable tag, so callers
+// validating a digest group get exactly the grouped bytes. It applies the
+// same bounded read, decoding, and workspace validation as the by-tag path.
+func (wc *workspaceClient) fetchManifestByDesc(ctx context.Context, desc ocispec.Descriptor) (ocispec.Manifest, error) {
+	rc, err := wc.client.repoClient.inner.Fetch(ctx, desc)
+	if err != nil {
+		return ocispec.Manifest{}, err
+	}
 	defer func() { _ = rc.Close() }()
 
 	data, err := io.ReadAll(io.LimitReader(rc, maxManifestSize))
 	if err != nil {
-		return ocispec.Manifest{}, ocispec.Descriptor{}, err
+		return ocispec.Manifest{}, err
 	}
 
 	var m ocispec.Manifest
 	if err := json.Unmarshal(data, &m); err != nil {
-		return ocispec.Manifest{}, ocispec.Descriptor{}, fmt.Errorf("decoding manifest %q: %w", reference, err)
+		return ocispec.Manifest{}, fmt.Errorf("decoding manifest %s: %w", desc.Digest, err)
 	}
 	if m.Annotations == nil {
 		m.Annotations = map[string]string{}
 	}
-	if err := validateWorkspaceManifest(m, reference, wc.stateID); err != nil {
-		return ocispec.Manifest{}, ocispec.Descriptor{}, err
+	if err := validateWorkspaceManifest(m, desc.Digest.String(), wc.stateID); err != nil {
+		return ocispec.Manifest{}, err
 	}
-	return m, desc, nil
+	return m, nil
 }
 
 // ─── Package-level helpers ────────────────────────────────────────────────────
