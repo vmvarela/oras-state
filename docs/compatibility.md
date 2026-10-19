@@ -9,10 +9,11 @@ Compatibility testing lives in this repository because it belongs to the shared 
 | Registry | State read/write | Locking | Version history | Client-side retention | Compression | Large state |
 |---|---|---|---|---|---|---|
 | Zot | ✅ CI + local | ✅ CI + local | ✅ CI + local | ✅ CI + local | ✅ CI + local | ✅ 2 MiB local |
-| GHCR (`ghcr.io`) | ✅ CI | ✅ CI | ✅ CI | ⚠️ skipped by design | ✅ CI | not tested |
+| GHCR (`ghcr.io`) | ✅ opt-in CI | ✅ opt-in CI | ✅ opt-in CI | ⚠️ skipped by design | ✅ opt-in CI | not tested |
 | Harbor | ✅ opt-in | ✅ opt-in | ✅ opt-in | ✅ opt-in | ✅ opt-in | not tested |
 
-- **CI** = exercised on every push and pull request by the `zot-integration` and `ghcr-integration` jobs in [`.github/workflows/test.yml`](../.github/workflows/test.yml). The GHCR job runs on non-fork pull requests and pushes to the default branch.
+- **CI** = exercised automatically by the `zot-integration` job in [`.github/workflows/test.yml`](../.github/workflows/test.yml). GHCR is opt-in: manually run the workflow on the default branch and enable `run_ghcr`; the job writes to `ghcr.io/vmvarela/oras-state`.
+- **opt-in CI** = exercised only when explicitly enabled in a manual workflow run.
 - **opt-in** = exercised manually with the Harbor suite (see [Running the suites](#running-the-suites)); evaluation results are recorded in this document.
 - **⚠️ GHCR retention** = the engine skips automatic pruning on `ghcr.io`, so `MaxVersions` does not bound history there; the GHCR suite asserts this documented behavior.
 

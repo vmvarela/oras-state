@@ -4,6 +4,12 @@ on:
   pull_request:
   push:
     branches: [master]
+  workflow_dispatch:
+    inputs:
+      run_ghcr:
+        description: Run live GHCR integration tests (writes to ghcr.io/vmvarela/oras-state)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -55,7 +61,7 @@ jobs:
 
   ghcr-integration:
     name: Integration Test (GHCR)
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_ghcr
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
