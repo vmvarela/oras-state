@@ -143,7 +143,7 @@ go test ./...
 go test -race ./...
 ```
 
-The CI suite also exercises registry integration behavior, including Zot and GHCR-specific paths. See [docs/compatibility.md](docs/compatibility.md) for the tested registry matrix, per-registry differences, and how to run each integration suite.
+CI automatically exercises Zot integration behavior. GHCR integration is opt-in and requires manually enabling `run_ghcr` in the Test workflow. See [docs/compatibility.md](docs/compatibility.md) for the tested registry matrix, per-registry differences, and how to run each integration suite.
 
 ## Design rule
 
