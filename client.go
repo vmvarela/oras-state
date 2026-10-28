@@ -507,7 +507,7 @@ func (wc *workspaceClient) put(ctx context.Context, state []byte) error {
 	wc.client.retentionWg.Add(1)
 	select {
 	case sem <- struct{}{}:
-		go func() {
+		go func() { // #nosec G118 -- intentionally continues after the caller's context is cancelled, with a 30s timeout
 			defer wc.client.retentionWg.Done()
 			defer func() { <-sem }()
 			asyncCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

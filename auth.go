@@ -31,10 +31,10 @@ func BuildHTTPClient(skipVerify bool, caFile string) (*http.Client, error) {
 	if t.TLSClientConfig == nil {
 		t.TLSClientConfig = &tls.Config{} //nolint:gosec
 	}
-	t.TLSClientConfig.InsecureSkipVerify = skipVerify //nolint:gosec // intentional per user config
+	t.TLSClientConfig.InsecureSkipVerify = skipVerify // #nosec G402 -- InsecureSkipVerify is configurable by the caller; the zero-value Config verifies certificates
 
 	if caFile != "" {
-		pem, err := os.ReadFile(caFile)
+		pem, err := os.ReadFile(caFile) // #nosec G304 -- the path is supplied by the caller and the PEM content is used as the trusted CA pool
 		if err != nil {
 			return nil, fmt.Errorf("reading ca_file %q: %w", caFile, err)
 		}
