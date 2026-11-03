@@ -320,12 +320,6 @@ func tokenCredential(registry, token string) orasCredentials.Credential {
 	return orasCredentials.Credential{AccessToken: token}
 }
 
-// credentialHost is the host v3 challenges resolve for registry, including the
-// docker.io alias it uses for Docker Hub.
-func credentialHost(registry string) string {
-	return orasProperties.Reference{Registry: registry}.Host()
-}
-
 func resolveCredentials(registry, repository string, cfg Config) (orasCredentials.CredentialFunc, string, orasCredentials.Credential) {
 	// Normalize the host so case variants ("GHCR.IO") and Docker-style keys
 	// ("https://ghcr.io/v1/") match the GHCR-specific paths below.
@@ -333,7 +327,7 @@ func resolveCredentials(registry, repository string, cfg Config) (orasCredential
 
 	// Priority 0: caller-supplied resolver (used by OpenTofu integration).
 	if cfg.CredentialFunc != nil {
-		want := credentialHost(registry)
+		want := (orasProperties.Resource{Registry: registry}).Host()
 		return func(ctx context.Context, resource orasProperties.Resource) (orasCredentials.Credential, error) {
 			// v3 also challenges blob upload hosts on another registry. The
 			// caller resolves a registry host's credentials, so never forward
