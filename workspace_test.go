@@ -14,7 +14,7 @@ import (
 	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	orasRegistry "oras.land/oras-go/v2/registry"
+	orasProperties "github.com/oras-project/oras-go/v3/registry/remote/properties"
 )
 
 func TestWorkspaceMappingRegression(t *testing.T) {
@@ -27,7 +27,7 @@ func TestWorkspaceMappingRegression(t *testing.T) {
 	for _, name := range []string{strings.Repeat("a", 128), strings.Repeat("a", 129), "a/b", "ws-c14cddc033f64b9d", "日本語", "default"} {
 		wc := newWorkspaceClient(nil, name)
 		for _, tag := range []string{wc.stateTag, wc.lockTag, wc.unlockedTag, wc.versionTagFor(1), wc.versionTagFor(1 << 30), wc.versionTagFor(int(^uint(0) >> 1))} {
-			if err := (orasRegistry.Reference{Reference: tag}).ValidateReferenceAsTag(); err != nil {
+			if err := (orasProperties.Reference{Tag: tag}).ValidateTag(); err != nil {
 				t.Errorf("workspace %q produces invalid tag %q: %v", name, tag, err)
 			}
 		}

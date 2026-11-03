@@ -34,9 +34,9 @@ import (
 
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"oras.land/oras-go/v2/errdef"
-	orasRemote "oras.land/oras-go/v2/registry/remote"
-	orasErrcode "oras.land/oras-go/v2/registry/remote/errcode"
+	"github.com/oras-project/oras-go/v3/errdef"
+	orasRemote "github.com/oras-project/oras-go/v3/registry/remote"
+	orasErrcode "github.com/oras-project/oras-go/v3/registry/remote/errcode"
 )
 
 // tagRetryServer is a minimal OCI Distribution registry over httptest. It
@@ -238,7 +238,7 @@ func newTagRetryRepo(t *testing.T, srv *httptest.Server) *workspaceClient {
 	if err != nil {
 		t.Fatalf("new remote repository %q: %v", repoRef, err)
 	}
-	repo.PlainHTTP = true
+	repo.Registry.PlainHTTP = true
 	return newRemoteClient(&orasRepositoryClient{inner: repo, repository: repoRef}, "default")
 }
 

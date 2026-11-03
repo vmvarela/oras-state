@@ -13,8 +13,8 @@ import (
 	"sync"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	orasProperties "github.com/oras-project/oras-go/v3/registry/remote/properties"
 	"golang.org/x/sync/errgroup"
-	orasRegistry "oras.land/oras-go/v2/registry"
 )
 
 const legacyVersionWorkspaceValidationLimitPerBase = 16
@@ -22,8 +22,8 @@ const legacyVersionWorkspaceValidationLimitPerBase = 16
 // legacyWorkspaceTagFor reproduces the exact workspace tag mapping used
 // by the legacy backend layout. It is intentionally not the default layout.
 func legacyWorkspaceTagFor(workspace string) string {
-	ref := orasRegistry.Reference{Reference: workspace}
-	if err := ref.ValidateReferenceAsTag(); err == nil {
+	ref := orasProperties.Reference{Tag: workspace}
+	if err := ref.ValidateTag(); err == nil {
 		return workspace
 	}
 	h := sha256.Sum256([]byte(workspace))
@@ -35,7 +35,7 @@ func legacyWorkspaceTagFor(workspace string) string {
 // merely because literal legacy tags exist.
 func (wc *workspaceClient) checkLegacyWorkspace(ctx context.Context) error {
 	for _, tag := range []string{wc.stateTag, wc.lockTag, wc.unlockedTag, wc.versionTagFor(maxStateVersion)} {
-		if err := (orasRegistry.Reference{Reference: tag}).ValidateReferenceAsTag(); err != nil {
+		if err := (orasProperties.Reference{Tag: tag}).ValidateTag(); err != nil {
 			return fmt.Errorf("invalid workspace tag: %w", err)
 		}
 	}
