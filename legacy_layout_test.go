@@ -44,7 +44,6 @@ func TestWorkspaceLayout_LegacyPreservesExistingTags(t *testing.T) {
 	})
 }
 
-
 func TestLegacyDeleteWorkspaceRemovesStateHistoryAndLock(t *testing.T) {
 	ctx := context.Background()
 	c := newTestClient(&orasRepositoryClient{inner: newFakeORASRepo()})

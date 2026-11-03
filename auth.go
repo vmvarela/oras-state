@@ -14,8 +14,10 @@ import (
 	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	orasRemote "oras.land/oras-go/v2/registry/remote"
-	orasAuth "oras.land/oras-go/v2/registry/remote/auth"
+	orasRemote "github.com/oras-project/oras-go/v3/registry/remote"
+	orasAuth "github.com/oras-project/oras-go/v3/registry/remote/auth"
+	orasCredentials "github.com/oras-project/oras-go/v3/registry/remote/credentials"
+	orasProperties "github.com/oras-project/oras-go/v3/registry/remote/properties"
 )
 
 // BuildHTTPClient constructs an *http.Client with the specified TLS settings.
@@ -156,9 +158,9 @@ type orasRepository interface {
 type orasRepositoryClient struct {
 	repository   string // full reference: registry/repository
 	inner        orasRepository
-	token        string              // access token (for GHCR API calls)
-	resolvedCred orasAuth.Credential // resolved credential, whatever path produced it
-	credentialFn orasAuth.CredentialFunc
+	token        string                     // access token (for GHCR API calls)
+	resolvedCred orasCredentials.Credential // resolved credential, whatever path produced it
+	credentialFn orasCredentials.CredentialFunc
 	httpClient   *http.Client
 }
 
@@ -179,7 +181,8 @@ func (r *orasRepositoryClient) accessToken(ctx context.Context) (string, error) 
 		return r.resolvedCred.Password, nil
 	}
 	if r.credentialFn != nil {
-		cred, err := r.credentialFn(ctx, normalizeRegistryHost(strings.SplitN(r.repository, "/", 2)[0]))
+		host := normalizeRegistryHost(strings.SplitN(r.repository, "/", 2)[0])
+		cred, err := r.credentialFn(ctx, orasProperties.Resource{Registry: host})
 		if err != nil {
 			return "", err
 		}
@@ -222,7 +225,7 @@ func newORASRepositoryClient(registry, repository string, cfg Config) (*orasRepo
 	}
 
 	if cfg.PlainHTTP {
-		repo.PlainHTTP = true
+		repo.Registry.PlainHTTP = true
 	}
 
 	// Use provided HTTP client if set, otherwise build one
@@ -261,10 +264,10 @@ func newORASRepositoryClient(registry, repository string, cfg Config) (*orasRepo
 	// consumers and should be supplied through CredentialFunc.
 	cred, resolvedToken, resolvedCred := resolveCredentials(registry, repository, cfg)
 
-	repo.Client = &orasAuth.Client{
-		Client:     httpClient,
-		Credential: cred,
-		Cache:      orasAuth.NewCache(),
+	repo.Registry.Client = &orasAuth.Client{
+		Client:         httpClient,
+		CredentialFunc: cred,
+		Cache:          orasAuth.NewCache(),
 	}
 
 	return &orasRepositoryClient{
@@ -310,66 +313,79 @@ func newORASRepositoryClient(registry, repository string, cfg Config) (*orasRepo
 // instead requires basic auth against its token endpoint; any non-empty
 // username is accepted (Docker CLI convention). Other registries keep the
 // AccessToken as-is.
-func tokenCredential(registry, token string) orasAuth.Credential {
+func tokenCredential(registry, token string) orasCredentials.Credential {
 	if registry == "ghcr.io" {
-		return orasAuth.Credential{Username: "x", Password: token}
+		return orasCredentials.Credential{Username: "x", Password: token}
 	}
-	return orasAuth.Credential{AccessToken: token}
+	return orasCredentials.Credential{AccessToken: token}
 }
 
-func resolveCredentials(registry, repository string, cfg Config) (orasAuth.CredentialFunc, string, orasAuth.Credential) {
+// credentialHost is the host v3 challenges resolve for registry, including the
+// docker.io alias it uses for Docker Hub.
+func credentialHost(registry string) string {
+	return orasProperties.Reference{Registry: registry}.Host()
+}
+
+func resolveCredentials(registry, repository string, cfg Config) (orasCredentials.CredentialFunc, string, orasCredentials.Credential) {
 	// Normalize the host so case variants ("GHCR.IO") and Docker-style keys
 	// ("https://ghcr.io/v1/") match the GHCR-specific paths below.
 	registry = normalizeRegistryHost(registry)
 
 	// Priority 0: caller-supplied resolver (used by OpenTofu integration).
 	if cfg.CredentialFunc != nil {
-		return func(ctx context.Context, hostport string) (orasAuth.Credential, error) {
-			cred, err := cfg.CredentialFunc(ctx, hostport)
-			if err != nil {
-				return orasAuth.EmptyCredential, err
+		want := credentialHost(registry)
+		return func(ctx context.Context, resource orasProperties.Resource) (orasCredentials.Credential, error) {
+			// v3 also challenges blob upload hosts on another registry. The
+			// caller resolves a registry host's credentials, so never forward
+			// them to a host this client was not configured for.
+			if resource.Host() != want {
+				return orasCredentials.EmptyCredential, nil
 			}
-			return orasAuth.Credential{
+			cred, err := cfg.CredentialFunc(ctx, resource.Host())
+			if err != nil {
+				return orasCredentials.EmptyCredential, err
+			}
+			return orasCredentials.Credential{
 				Username:    cred.Username,
 				Password:    cred.Password,
 				AccessToken: cred.AccessToken,
 			}, nil
-		}, "", orasAuth.EmptyCredential
+		}, "", orasCredentials.EmptyCredential
 	}
 
 	// Priority 1: Explicit token
 	if cfg.Token != "" {
 		cred := tokenCredential(registry, cfg.Token)
-		return orasAuth.StaticCredential(registry, cred), cfg.Token, cred
+		return orasCredentials.StaticCredentialFunc(registry, cred), cfg.Token, cred
 	}
 
 	// Priority 2: Explicit username/password
 	if cfg.Username != "" || cfg.Password != "" {
-		cred := orasAuth.Credential{Username: cfg.Username, Password: cfg.Password}
-		return orasAuth.StaticCredential(registry, cred), "", cred
+		cred := orasCredentials.Credential{Username: cfg.Username, Password: cfg.Password}
+		return orasCredentials.StaticCredentialFunc(registry, cred), "", cred
 	}
 
 	// Priority 3: Environment variable fallback
 	// Check ORAS_TOKEN (applies to any registry)
 	if t := os.Getenv("ORAS_TOKEN"); t != "" {
 		cred := tokenCredential(registry, t)
-		return orasAuth.StaticCredential(registry, cred), t, cred
+		return orasCredentials.StaticCredentialFunc(registry, cred), t, cred
 	}
 
 	// For ghcr.io, also check GHCR_TOKEN and GITHUB_TOKEN
 	if registry == "ghcr.io" {
 		if t := os.Getenv("GHCR_TOKEN"); t != "" {
 			cred := tokenCredential(registry, t)
-			return orasAuth.StaticCredential(registry, cred), t, cred
+			return orasCredentials.StaticCredentialFunc(registry, cred), t, cred
 		}
 		if t := os.Getenv("GITHUB_TOKEN"); t != "" {
 			cred := tokenCredential(registry, t)
-			return orasAuth.StaticCredential(registry, cred), t, cred
+			return orasCredentials.StaticCredentialFunc(registry, cred), t, cred
 		}
 	}
 
 	// Fall back to anonymous access
-	return orasAuth.StaticCredential(registry, orasAuth.EmptyCredential), "", orasAuth.EmptyCredential
+	return orasCredentials.StaticCredentialFunc(registry, orasCredentials.EmptyCredential), "", orasCredentials.EmptyCredential
 }
 
 // userAgentRoundTripper wraps an http.RoundTripper to add a custom User-Agent

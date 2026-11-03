@@ -28,10 +28,10 @@ import (
 	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	oras "github.com/oras-project/oras-go/v3"
+	"github.com/oras-project/oras-go/v3/errdef"
+	orasErrcode "github.com/oras-project/oras-go/v3/registry/remote/errcode"
 	"golang.org/x/sync/errgroup"
-	oras "oras.land/oras-go/v2"
-	"oras.land/oras-go/v2/errdef"
-	orasErrcode "oras.land/oras-go/v2/registry/remote/errcode"
 )
 
 const (

@@ -18,8 +18,8 @@ import (
 
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"oras.land/oras-go/v2/errdef"
-	orasErrcode "oras.land/oras-go/v2/registry/remote/errcode"
+	"github.com/oras-project/oras-go/v3/errdef"
+	orasErrcode "github.com/oras-project/oras-go/v3/registry/remote/errcode"
 )
 
 // testObservationTimeout bounds waiting for the helper's first observation
