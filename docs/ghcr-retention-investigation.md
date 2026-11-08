@@ -2,8 +2,8 @@
 
 `MaxVersions > 0` publishes readable history on GHCR but does not bound it. Keep
 automatic pruning disabled: deleting a GitHub package version is broader than
-removing a history tag, and the available evidence does not establish safe
-deletion under concurrent tag changes or preservation of shared layers.
+removing a history tag, and a live experiment showed a deletion destroying state
+that a concurrent writer had just attached to the same version.
 
 This is the investigation for [#28](https://github.com/vmvarela/oras-state/issues/28),
 reviewed on 2026-11-08 against `35ee4110bd6c35062f2671f2374ff960a8bc96b7`.
@@ -41,8 +41,9 @@ the new writer protocol.
 Neither the cited GitHub deletion contract nor OCI's manifest-deletion section
 specifies GHCR's shared-layer garbage-collection guarantees or reclamation
 timing. Distinct manifest digests therefore do not, by themselves, demonstrate
-shared-layer safety. No live deletion experiment was performed for this review;
-shared-layer survival remains unverified, not known to be broken.
+shared-layer safety. A live experiment (below) showed surviving manifests still
+reading their shared blobs after a deletion; it does not establish when, or
+whether, GHCR ever reclaims the bytes.
 
 ## Permissions: writing is not deletion
 
@@ -123,6 +124,37 @@ manifest. Sweeping untagged state/lock versions is separate garbage collection
 and outside #28. Logical deletion also says nothing about when GHCR reclaims
 physical bytes; do not promise a storage quota or savings from `MaxVersions`.
 
+## Live deletion experiment (2026-11-08)
+
+An explicitly authorized disposable package,
+`oras-state-retention-probe-2937c7107511dcec6dfbbdbe` under the `vmvarela`
+account, was published with synthetic payloads and then deleted. The package
+itself was removed at the end of the run (`DELETE` 204, followed by an
+authenticated `GET` 404); the throwaway test runner was not committed.
+
+Package version IDs and complete tag sets were snapshotted through the Packages
+API before and after each operation. Every survivor read resolved the tag **and**
+fetched the digest it pointed at, then compared the decoded state byte for byte.
+
+| Check | Result |
+|---|---|
+| Deleting one version removes every alias | A version carrying three tags (one history tag and two synthetic unknown tags) lost all three tags and its manifest digest after a single `DELETE` 204. |
+| Shared payload blobs survive | Eight survivor manifests across both compression modes — current state, retained history, and another workspace's current and history — stayed readable byte-for-byte by tag and by digest, and their config and payload blobs re-fetched with matching digest and size, including 30 seconds after the deletion. |
+| A protected alias added after enumeration is destroyed | A version holding only a history tag was enumerated; the current-state tag was then pointed at that same version ID, confirmed by a second snapshot. Deleting the ID returned 204 and left both tags and the digest at 404; `Get` then returned `nil` state instead of an error. |
+| Tag moves leave untagged versions | Repeated overwrites left versions whose tag list was empty, which the API still reports. |
+
+The shared-blob result removes one of the two blockers: GHCR did not reclaim
+blobs still referenced by surviving manifests, in either the plain or the gzip
+layout. The alias race went the other way — it is no longer hypothetical. Under
+the current design a pruner can enumerate a version, an ordinary writer can then
+point protected state at it, and the delete removes that state while other
+workspaces keep reading normally.
+
+Limits: this is one snapshot on one package with synthetic data. It does not
+predict future garbage-collection behaviour, reclamation timing, or behaviour
+under retention pressure, and the concurrency scenario was reproduced
+deliberately rather than observed in production.
+
 ## Evidence and the gate to reconsider
 
 | Claim | Evidence | Limit |
@@ -130,13 +162,18 @@ physical bytes; do not promise a storage quota or savings from `MaxVersions`.
 | Current/history manifests differ but share the state layer | `TestPut_CurrentAndHistoryManifestsDistinct` in [recovery_test.go](../recovery_test.go), compressed and uncompressed | Local fake registry, not GHCR garbage collection |
 | GHCR writes publish history without automatic delete or cleanup retagging | `TestGHCR_AutomaticRetentionDisabledHistoryReadable` in [recovery_test.go](../recovery_test.go) | Confirms the guard, not that pruning is safe |
 | API fallback pins a matching digest and handles pagination/statuses | [ghcr_http_test.go](../ghcr_http_test.go) | HTTP fixtures do not establish real alias or layer deletion semantics |
-| Live suite preserves all three histories with `MaxVersions: 2` | `TestGHCRIntegration_HistoryAndCompression` in [ghcr_integration_test.go](../ghcr_integration_test.go) | Existing opt-in coverage; not run for this investigation and not a pruning test |
+| Live suite preserves all three histories with `MaxVersions: 2` | `TestGHCRIntegration_HistoryAndCompression` in [ghcr_integration_test.go](../ghcr_integration_test.go) | Existing opt-in coverage; not a pruning test |
 | Deletion is version-wide and needs stronger access | [REST contract][packages], [package deletion guide][delete-restore] and local fallback | No documented atomic tag-set condition or shared-layer GC contract |
+| Deletion removes every alias of a version | Live experiment, 2026-11-08 | One disposable package, synthetic data |
+| Surviving manifests keep shared plain/gzip blobs readable | Live experiment, 2026-11-08 | Snapshot only; says nothing about reclamation timing |
+| A protected alias attached after enumeration is destroyed | Live experiment, 2026-11-08 | Reproduced deliberately, not sampled |
 
-Before reconsidering, use an explicitly authorized disposable GHCR package with
-an anchor version and synthetic state. Record package version IDs, complete tag
+The experiment described above satisfies the evidence requirement from the
+first version of this document; any future design needs its own repeat. Before
+reconsidering, use an explicitly authorized disposable GHCR package with an
+anchor version and synthetic state, and record package version IDs, complete tag
 sets, manifest/config/layer digests and payload hashes before and after each
-operation. The experiment must cover multi-tag deletion; distinct current/kept
+operation. It must cover multi-tag deletion; distinct current/kept
 history/other-workspace manifests sharing blobs (plain and gzip); unknown/legacy
 aliases; a protected alias added after enumeration; and write-only versus
 delete-capable credentials. Read survivors by tag and digest, including after
@@ -145,9 +182,11 @@ pagination failures, stale metadata, tag moves and permission failures.
 
 A passing snapshot experiment alone cannot prove future GC behavior or eliminate
 the alias race. Reconsider only with evidence for shared-layer preservation
-**and** an enforceable concurrency contract, then open a narrowly scoped
-implementation issue in `oras-state`. Until then, the decision is **no-go**:
-retain the automatic-pruning guard and the [README warning](../README.md#read-only-state-history).
+**and** an enforceable concurrency contract — the observed race means the second
+condition now requires a server-enforced precondition or an exclusive-writer
+boundary, not a recheck — then open a narrowly scoped implementation issue in
+`oras-state`. Until then, the decision is **no-go**: retain the
+automatic-pruning guard and the [README warning](../README.md#read-only-state-history).
 
 [packages]: https://docs.github.com/en/rest/packages/packages#delete-package-version-for-an-organization
 [container-auth]: https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-to-the-container-registry
