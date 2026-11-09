@@ -114,6 +114,8 @@ if len(versions) > 0 {
 
 `MaxVersions <= 0` stops publishing new version history (already-published history can remain readable); a positive value publishes history and targets that many retained versions. On registries other than ghcr.io, pruning is best-effort: unmarked, unknown, or ambiguous legacy entries may be preserved. On ghcr.io, history is still published and readable, but automatic pruning is skipped — `MaxVersions` does **not** bound history there, and it may grow without limit.
 
+See the [GHCR retention investigation](docs/ghcr-retention-investigation.md) for deletion semantics, required permissions, and the evidence needed before enabling automatic pruning.
+
 Before relying on the new retention behavior, stop old writers and wait for their asynchronous retention workers to finish: a new instance does not fence or protect against old processes still reading, writing, or pruning.
 
 The API deliberately exposes logical versions and verified manifest digests, not OCI tag names. It is read-only: restore, per-version deletion, and garbage collection are outside this contract.

@@ -30,7 +30,7 @@ The mandatory CI target. Tests run PlainHTTP without authentication, using eithe
 - Manifest `DELETE` is not supported (HTTP 405). Explicit `Delete`/`DeleteWorkspace` fall back to the GitHub Packages API; `Unlock` retags the lock tag to an `unlocked-` marker instead.
 - Automatic pruning is skipped entirely on `ghcr.io` — `Put` issues no delete at all — so `MaxVersions` does not bound history there and it can grow without limit. Explicit deletes still work through the Packages API fallback.
 - Deleting the last tagged version of a package can be rejected by GHCR; the integration tests keep an anchor fixture for this reason.
-- Authentication uses a token with `packages:write` scope (the CI job uses the workflow `GITHUB_TOKEN`).
+- Publication uses a classic PAT with `write:packages` and package write access, or the workflow `GITHUB_TOKEN` with `packages: write`. Deletion requires additional access; see the [GHCR retention investigation](ghcr-retention-investigation.md#permissions-writing-is-not-deletion).
 
 ### Harbor
 
@@ -64,7 +64,8 @@ go test -race -count=1 -timeout 10m ./...
 TF_ORAS_ZOT_TEST=1 go test -race -count=1 -timeout 300s -run Zot ./...
 TF_ORAS_ZOT_TEST=1 TF_ORAS_ZOT_BINARY=/path/to/zot go test -race -count=1 -timeout 300s -run Zot ./...
 
-# GHCR (token needs the packages:write scope)
+# GHCR (classic PAT: read:packages + write:packages + delete:packages and package admin;
+# the suite includes explicit deletion; Actions GITHUB_TOKEN needs package admin)
 TF_ORAS_GHCR_TEST=1 TF_ORAS_GHCR_TOKEN=... go test -race -count=1 -timeout 300s -run TestGHCRIntegration ./...
 
 # Harbor (any reachable instance; plain HTTP by default, set TF_ORAS_HARBOR_PLAIN_HTTP=0 for https)
