@@ -123,6 +123,7 @@ The API deliberately exposes logical versions and verified manifest digests, not
 ## Concurrency model
 
 OCI mutable tags are last-writer-wins and do not provide compare-and-swap semantics.
+See the [conditional-write investigation](docs/oci-cas-investigation.md) for the OCI, ORAS, and registry evidence behind this limit.
 
 `oras-state` therefore does **not** claim strict distributed CAS locking. It uses generation-aware lock metadata, ownership verification, bounded observation after ambiguous writes, and fail-closed behavior where blindly retrying a mutable tag could overwrite another writer.
 
