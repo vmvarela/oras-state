@@ -27,6 +27,7 @@ import (
 	"syscall"
 	"time"
 
+	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	oras "github.com/oras-project/oras-go/v3"
 	"github.com/oras-project/oras-go/v3/errdef"
@@ -39,6 +40,9 @@ const (
 	mediaTypeStateLayerGzip = "application/vnd.terraform.statefile.v1+gzip"
 	artifactTypeState       = "application/vnd.terraform.state.v1"
 	artifactTypeLock        = "application/vnd.terraform.lock.v1"
+	// artifactTypeWorkspaceMarker identifies the prospective workspace witness.
+	// It is deliberately distinct from state and lock artifact types.
+	artifactTypeWorkspaceMarker = "application/vnd.terraform.workspace.v1"
 
 	annotationWorkspace    = "org.terraform.workspace"
 	annotationUpdatedAt    = "org.terraform.state.updated_at"
@@ -84,13 +88,19 @@ const lockCleanupTimeout = 30 * time.Second
 //   - Lock is stored at "locked-<workspaceTag>".
 //   - On registries that don't support manifest deletion (GHCR returns 405),
 //     unlock retags to "unlocked-<workspaceTag>" instead.
+//   - The prospective workspace witness is stored at "wsmeta-<workspaceTag>".
 const (
 	stateTagPrefix           = "state-"
 	lockTagPrefix            = "locked-"
 	unlockedTagPrefix        = "unlocked-"
 	stateVersionTagPrefix    = "stver-"
+	markerTagPrefix          = "wsmeta-"
 	stateVersionTagSeparator = "-v"
 )
+
+// workspaceMarkerCreated is a fixed timestamp so a workspace marker's
+// annotations and digest are deterministic for its exact original name.
+const workspaceMarkerCreated = "1970-01-01T00:00:00Z"
 
 // maxStateVersion bounds version numbers (32-bit safe); tags beyond it are
 // not recognized as version tags.
@@ -203,6 +213,7 @@ type workspaceClient struct {
 	versionTagBase string
 	lockTag        string
 	unlockedTag    string
+	markerTag      string
 }
 
 // newWorkspaceClient creates a workspaceClient for the given stateID (workspace name).
@@ -215,6 +226,7 @@ func newWorkspaceClient(c *Client, stateID string) *workspaceClient {
 		versionTagBase: stateVersionTagPrefix + wsTag,
 		lockTag:        lockTagPrefix + wsTag,
 		unlockedTag:    unlockedTagPrefix + wsTag,
+		markerTag:      markerTagPrefix + wsTag,
 	}
 }
 
@@ -238,11 +250,17 @@ func (c *Client) opContext(ctx context.Context) (context.Context, context.Cancel
 }
 
 // Get retrieves the state for the given stateID. Returns nil if no state exists.
+//
+// When the current tag is absent in the hashed layout, a valid workspace
+// marker turns the absence into an explicit fail-closed error instead of nil:
+// the marker witnesses that initialization was attempted (or that state was
+// lost). A genuinely absent marker preserves nil; malformed or uncertain
+// marker metadata propagates. Legacy layout is unchanged.
 func (c *Client) Get(ctx context.Context, stateID string) ([]byte, error) {
 	ctx, cancel := c.opContext(ctx)
 	defer cancel()
 	wc := newWorkspaceClient(c, stateID)
-	if err := wc.checkWorkspace(ctx); err != nil {
+	if _, err := wc.checkWorkspace(ctx); err != nil {
 		return nil, err
 	}
 	return retryWithResult(ctx, func(ctx context.Context) ([]byte, error) {
@@ -260,11 +278,34 @@ func (c *Client) maxStateSize() int64 {
 	return c.config.MaxStateSize
 }
 
+// checkStateSize is the shared local, non-mutating size validation. Callers
+// run it before any registry write (including the workspace marker).
+func (c *Client) checkStateSize(size int) error {
+	if limit := c.maxStateSize(); int64(size) > limit {
+		return fmt.Errorf("state size exceeds maximum allowed size of %d bytes; use the max_state_size option to increase the limit", limit)
+	}
+	return nil
+}
+
 func (wc *workspaceClient) get(ctx context.Context) ([]byte, error) {
 	data, err := wc.readStateReference(ctx, wc.stateTag)
 	if err != nil {
 		if isNotFound(err) && !isMissingContent(err) {
-			// The tag itself is absent: genuinely no state.
+			// The tag itself is absent. In the hashed layout the marker is
+			// re-resolved directly (not trusted from an earlier listing): a
+			// concurrent initializer may have published it after that listing.
+			// A valid marker turns the absence into a fail-closed error; real
+			// marker absence preserves nil; malformed/incomplete metadata
+			// propagates. Legacy layout is unchanged.
+			if wc.client.config.WorkspaceLayout != WorkspaceLayoutLegacy {
+				present, markerErr := wc.verifiedMarkerPresent(ctx)
+				if markerErr != nil {
+					return nil, markerErr
+				}
+				if present {
+					return nil, fmt.Errorf("state for workspace %q is absent but workspace marker %q exists: refusing to report missing state; recover it or explicitly reset with Delete (the marker is a witness, not a transaction)", wc.stateID, wc.markerTag)
+				}
+			}
 			return nil, nil
 		}
 		if isMissingContent(err) {
@@ -364,15 +405,30 @@ func (c *Client) Put(ctx context.Context, stateID string, data []byte) error {
 	ctx, cancel := c.opContext(ctx)
 	defer cancel()
 	wc := newWorkspaceClient(c, stateID)
-	if err := wc.checkWorkspace(ctx); err != nil {
+	obs, err := wc.checkWorkspace(ctx)
+	if err != nil {
 		return err
+	}
+	// Local validation runs before any write, so an invalid request never
+	// leaves a marker behind.
+	if err := c.checkStateSize(len(data)); err != nil {
+		return err
+	}
+	if c.config.WorkspaceLayout != WorkspaceLayoutLegacy {
+		// The marker is published BEFORE any state manifest. A failure or
+		// ambiguous result aborts the Put: never warn-and-continue. A later
+		// initialization failure leaves the marker in place for explicit
+		// reset; it is deliberately not cleared here.
+		if err := wc.ensureWorkspaceMarker(ctx, obs); err != nil {
+			return err
+		}
 	}
 	return wc.put(ctx, data)
 }
 
 func (wc *workspaceClient) put(ctx context.Context, state []byte) error {
-	if limit := wc.client.maxStateSize(); int64(len(state)) > limit {
-		return fmt.Errorf("state size exceeds maximum allowed size of %d bytes; use the max_state_size option to increase the limit", limit)
+	if err := wc.client.checkStateSize(len(state)); err != nil {
+		return err
 	}
 
 	stateToPush := state
@@ -539,30 +595,184 @@ func (wc *workspaceClient) put(ctx context.Context, state []byte) error {
 	return nil
 }
 
+// packWorkspaceMarker builds and pushes the deterministic, zero-layer marker
+// manifest for wc. The fixed created timestamp keeps the digest stable for the
+// same exact workspace name.
+func (wc *workspaceClient) packWorkspaceMarker(ctx context.Context) (ocispec.Descriptor, error) {
+	configDesc, err := retryWithResult(ctx, func(ctx context.Context) (ocispec.Descriptor, error) {
+		return oras.PushBytes(ctx, wc.client.repoClient.inner, ocispec.MediaTypeEmptyJSON, ocispec.DescriptorEmptyJSON.Data)
+	})
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	m := ocispec.Manifest{
+		Versioned:    specs.Versioned{SchemaVersion: 2},
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: artifactTypeWorkspaceMarker,
+		Config:       configDesc,
+		Layers:       []ocispec.Descriptor{},
+		Annotations: map[string]string{
+			annotationWorkspace: wc.stateID,
+			annotationCreated:   workspaceMarkerCreated,
+		},
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	desc, err := retryWithResult(ctx, func(ctx context.Context) (ocispec.Descriptor, error) {
+		return oras.PushBytes(ctx, wc.client.repoClient.inner, ocispec.MediaTypeImageManifest, raw)
+	})
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	desc.ArtifactType = artifactTypeWorkspaceMarker
+	desc.Annotations = m.Annotations
+	return desc, nil
+}
+
+// createWorkspaceMarker publishes the marker before any state manifest. A
+// failure or ambiguous result is returned as-is: the caller must not publish
+// state without its witness.
+func (wc *workspaceClient) createWorkspaceMarker(ctx context.Context) error {
+	desc, err := wc.packWorkspaceMarker(ctx)
+	if err != nil {
+		return fmt.Errorf("preparing workspace marker %q: %w", wc.markerTag, err)
+	}
+	if err := wc.publishMutableTag(ctx, desc, wc.markerTag); err != nil {
+		return fmt.Errorf("publishing workspace marker %q before state: %w", wc.markerTag, err)
+	}
+	return nil
+}
+
+// ensureWorkspaceMarker adopts existing unmarked state and rejects marker-only
+// state. Only Put calls it, and it runs before any state publication. An
+// existing marker is always validated (identity, exact artifact type, zero
+// layers) before it is treated as established: a corrupt/incomplete marker
+// fails closed and no state publication follows.
+func (wc *workspaceClient) ensureWorkspaceMarker(ctx context.Context, obs workspaceObservation) error {
+	if obs.markerPresent {
+		present, err := wc.verifiedMarkerPresent(ctx)
+		if err != nil {
+			return err
+		}
+		if present {
+			if !obs.statePresent {
+				return wc.markerOnlyError()
+			}
+			return nil
+		}
+	}
+	return wc.createWorkspaceMarker(ctx)
+}
+
+func (wc *workspaceClient) markerOnlyError() error {
+	return fmt.Errorf("workspace %q has workspace marker %q but no current state: refusing to continue; recover the state or explicitly reset it with Delete (the marker is a witness, not a transaction)", wc.stateID, wc.markerTag)
+}
+
+// rejectMarkerOnly blocks Put/Lock on a valid marker without current state.
+// Unlock, VerifyLock, and history reads deliberately do not call it.
+func (wc *workspaceClient) rejectMarkerOnly(ctx context.Context, obs workspaceObservation) error {
+	if !obs.markerPresent || obs.statePresent {
+		return nil
+	}
+	present, err := wc.verifiedMarkerPresent(ctx)
+	if err != nil {
+		return err
+	}
+	if !present {
+		return nil
+	}
+	return wc.markerOnlyError()
+}
+
+// verifiedMarkerPresent validates the marker's identity, exact artifact type,
+// and zero layers. It returns false (not an error) only when the tag is
+// genuinely absent; malformed or incomplete metadata propagates.
+func (wc *workspaceClient) verifiedMarkerPresent(ctx context.Context) (bool, error) {
+	_, found, err := wc.resolveVerifiedMarker(ctx)
+	return found, err
+}
+
+// resolveVerifiedMarker resolves and PINS the marker descriptor, then validates
+// it. Deletion uses the pinned descriptor so a concurrent tag move cannot make
+// the cleanup delete a foreign object.
+func (wc *workspaceClient) resolveVerifiedMarker(ctx context.Context) (ocispec.Descriptor, bool, error) {
+	desc, err := retryWithResult(ctx, func(ctx context.Context) (ocispec.Descriptor, error) {
+		return wc.client.repoClient.inner.Resolve(ctx, wc.markerTag)
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return ocispec.Descriptor{}, false, nil
+		}
+		return ocispec.Descriptor{}, false, err
+	}
+	var m ocispec.Manifest
+	err = retry(ctx, func(ctx context.Context) error {
+		var fetchErr error
+		m, fetchErr = wc.fetchManifestByDesc(ctx, desc)
+		return fetchErr
+	})
+	if err != nil {
+		return ocispec.Descriptor{}, false, fmt.Errorf("verifying workspace marker %q: %w", wc.markerTag, err)
+	}
+	if err := validateWorkspaceMarker(m, wc.markerTag, wc.stateID); err != nil {
+		return ocispec.Descriptor{}, false, err
+	}
+	return desc, true, nil
+}
+
 // Delete removes the state for the given stateID. Returns nil if no state exists.
 //
 // The state tag is resolved ONCE and the resulting descriptor is pinned for
 // the bounded delete retries: a transient delete failure followed by a
 // concurrent writer publishing under the same tag must never make a retry
 // delete the later writer's manifest.
+//
+// Delete is also the explicit reset for marker-only state: the marker is
+// validated and pinned BEFORE any destructive work, the current state is
+// deleted first, and the marker last. Any earlier failure leaves the marker in
+// place so the reset can be retried.
 func (c *Client) Delete(ctx context.Context, stateID string) error {
 	ctx, cancel := c.opContext(ctx)
 	defer cancel()
 	wc := newWorkspaceClient(c, stateID)
-	if err := wc.checkWorkspace(ctx); err != nil {
+	if _, err := wc.checkWorkspace(ctx); err != nil {
 		return err
 	}
+
+	var (
+		markerDesc  ocispec.Descriptor
+		markerFound bool
+	)
+	if c.config.WorkspaceLayout != WorkspaceLayoutLegacy {
+		var err error
+		markerDesc, markerFound, err = wc.resolveVerifiedMarker(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
 	desc, err := retryWithResult(ctx, func(ctx context.Context) (ocispec.Descriptor, error) {
 		return wc.client.repoClient.inner.Resolve(ctx, wc.stateTag)
 	})
 	if err != nil {
-		if isNotFound(err) {
-			return nil
+		if !isNotFound(err) {
+			return err
 		}
+		// No current state: continue to the marker cleanup below instead of
+		// returning early.
+	} else if err := retry(ctx, func(ctx context.Context) error {
+		return wc.delete(ctx, desc)
+	}); err != nil {
 		return err
 	}
+
+	if !markerFound {
+		return nil
+	}
 	return retry(ctx, func(ctx context.Context) error {
-		return wc.delete(ctx, desc)
+		return wc.deleteDigestWithFallback(ctx, markerDesc, wc.markerTag)
 	})
 }
 
@@ -573,16 +783,32 @@ func (wc *workspaceClient) delete(ctx context.Context, desc ocispec.Descriptor) 
 	return wc.deleteDigestWithFallback(ctx, desc, wc.stateTag)
 }
 
-// DeleteWorkspace removes state, locks, unlocked markers, and retained state
-// versions for one logical workspace. It is the operation backend adapters
-// should use when implementing workspace deletion.
+// DeleteWorkspace removes state, locks, unlocked markers, retained state
+// versions, and the workspace marker for one logical workspace. It is the
+// operation backend adapters should use when implementing workspace deletion.
+// The marker is validated and pinned first and deleted last: any earlier
+// failure retains the witness so the cleanup can be retried. Owned tags that
+// alias the pinned marker digest are deferred to that final deletion. Marker
+// handling is absent in the legacy layout.
 func (c *Client) DeleteWorkspace(ctx context.Context, stateID string) error {
 	ctx, cancel := c.opContext(ctx)
 	defer cancel()
 
 	wc := newWorkspaceClient(c, stateID)
-	if err := wc.checkWorkspace(ctx); err != nil {
+	if _, err := wc.checkWorkspace(ctx); err != nil {
 		return err
+	}
+
+	var (
+		markerDesc  ocispec.Descriptor
+		markerFound bool
+	)
+	if c.config.WorkspaceLayout != WorkspaceLayoutLegacy {
+		var err error
+		markerDesc, markerFound, err = wc.resolveVerifiedMarker(ctx)
+		if err != nil {
+			return err
+		}
 	}
 
 	var tags []string
@@ -593,14 +819,17 @@ func (c *Client) DeleteWorkspace(ctx context.Context, stateID string) error {
 			return nil
 		})
 	})
-	if isNotFound(err) {
-		return nil
-	}
-	if err != nil {
+	if err != nil && !isNotFound(err) {
 		return err
 	}
 
+	sawMarkerTag := false
 	for _, tag := range tags {
+		if c.config.WorkspaceLayout != WorkspaceLayoutLegacy && tag == wc.markerTag {
+			// Deleted last, from the pinned descriptor, never by tag name.
+			sawMarkerTag = true
+			continue
+		}
 		owned := tag == wc.stateTag || tag == wc.lockTag || tag == wc.unlockedTag ||
 			strings.HasPrefix(tag, wc.versionTagBase+stateVersionTagSeparator)
 
@@ -630,8 +859,30 @@ func (c *Client) DeleteWorkspace(ctx context.Context, stateID string) error {
 		if resolveErr != nil {
 			return resolveErr
 		}
+		if markerFound && desc.Digest == markerDesc.Digest {
+			// An owned alias shares the pinned witness digest: deleting it now
+			// would remove the marker early. Defer it to the final cleanup.
+			continue
+		}
 		if err := wc.deleteDigestWithFallback(ctx, desc, tag); err != nil {
 			return err
+		}
+	}
+	if c.config.WorkspaceLayout != WorkspaceLayoutLegacy {
+		if !markerFound && sawMarkerTag {
+			// The marker appeared after the preflight (a concurrent Put):
+			// validate and pin it now so it is still deleted last, never by
+			// tag name.
+			var err error
+			markerDesc, markerFound, err = wc.resolveVerifiedMarker(ctx)
+			if err != nil {
+				return err
+			}
+		}
+		if markerFound {
+			if err := wc.deleteDigestWithFallback(ctx, markerDesc, wc.markerTag); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -642,8 +893,16 @@ func (c *Client) Lock(ctx context.Context, stateID string, info LockInfo) (strin
 	ctx, cancel := c.opContext(ctx)
 	defer cancel()
 	wc := newWorkspaceClient(c, stateID)
-	if err := wc.checkWorkspace(ctx); err != nil {
+	obs, err := wc.checkWorkspace(ctx)
+	if err != nil {
 		return "", err
+	}
+	if c.config.WorkspaceLayout != WorkspaceLayoutLegacy {
+		// Lock never creates a marker, preserving Lock→Get→Put first use. It
+		// rejects marker-only state (an interrupted/lost initialization).
+		if err := wc.rejectMarkerOnly(ctx, obs); err != nil {
+			return "", err
+		}
 	}
 	return wc.lock(ctx, &info)
 }
@@ -835,7 +1094,7 @@ func (c *Client) Unlock(ctx context.Context, stateID, lockID string) error {
 	ctx, cancel := c.opContext(ctx)
 	defer cancel()
 	wc := newWorkspaceClient(c, stateID)
-	if err := wc.checkWorkspace(ctx); err != nil {
+	if _, err := wc.checkWorkspace(ctx); err != nil {
 		return err
 	}
 	return wc.unlock(ctx, lockID)
@@ -856,7 +1115,7 @@ func (c *Client) VerifyLock(ctx context.Context, stateID, lockID string) error {
 	ctx, cancel := c.opContext(ctx)
 	defer cancel()
 	wc := newWorkspaceClient(c, stateID)
-	if err := wc.checkWorkspace(ctx); err != nil {
+	if _, err := wc.checkWorkspace(ctx); err != nil {
 		return err
 	}
 	return wc.verifyLock(ctx, lockID)
@@ -1697,7 +1956,9 @@ func listWorkspacesFromTags(ctx context.Context, repo *orasRepositoryClient) ([]
 	}
 	var out []string
 	for tag, name := range identities {
-		if strings.HasPrefix(tag, stateTagPrefix) {
+		// Marker-only workspaces are interrupted initializations, not absent
+		// workspaces: expose them instead of hiding them.
+		if strings.HasPrefix(tag, stateTagPrefix) || strings.HasPrefix(tag, markerTagPrefix) {
 			out = append(out, name)
 		}
 	}
@@ -1753,6 +2014,46 @@ func workspaceNameFromTag(ctx context.Context, repo *orasRepositoryClient, state
 		id, reserved := workspaceIDFromTag(stateTag)
 		if !ok || !reserved || id != workspaceTagFor(name) {
 			return "", fmt.Errorf("workspace identity mismatch at tag %q; stop writers and restore verified metadata (see docs/guides/workspace-migration.md)", stateTag)
+		}
+		return name, nil
+	})
+}
+
+// workspaceMarkerNameFromTag is the marker counterpart of
+// workspaceNameFromTag: identity, exact artifact type, and zero layers must all
+// validate. A tag that resolved but whose manifest content is missing is
+// uncertain, not a concurrent deletion.
+func workspaceMarkerNameFromTag(ctx context.Context, repo *orasRepositoryClient, tag string) (string, error) {
+	return retryWithResult(ctx, func(ctx context.Context) (string, error) {
+		desc, err := repo.inner.Resolve(ctx, tag)
+		if err != nil {
+			return "", err
+		}
+		rc, err := repo.inner.Fetch(ctx, desc)
+		if err != nil {
+			if isNotFound(err) {
+				return "", &missingContentError{fmt.Errorf("manifest %s for %q: %w", desc.Digest, tag, err)}
+			}
+			return "", err
+		}
+		defer func() { _ = rc.Close() }()
+
+		data, err := io.ReadAll(io.LimitReader(rc, maxManifestSize))
+		if err != nil {
+			return "", err
+		}
+
+		var m ocispec.Manifest
+		if err := json.Unmarshal(data, &m); err != nil {
+			return "", fmt.Errorf("decoding manifest for workspace tag %q: %w", tag, err)
+		}
+		name, ok := m.Annotations[annotationWorkspace]
+		id, reserved := workspaceIDFromTag(tag)
+		if !ok || !reserved || id != workspaceTagFor(name) {
+			return "", fmt.Errorf("workspace identity mismatch at tag %q; stop writers and restore verified metadata (see docs/guides/workspace-migration.md)", tag)
+		}
+		if err := validateWorkspaceMarker(m, tag, name); err != nil {
+			return "", err
 		}
 		return name, nil
 	})

@@ -32,30 +32,35 @@ func legacyWorkspaceTagFor(workspace string) string {
 
 // checkLegacyWorkspace validates only the tags owned by this workspace.
 // Unlike the strict hashed layout, it deliberately does not reject a repository
-// merely because literal legacy tags exist.
-func (wc *workspaceClient) checkLegacyWorkspace(ctx context.Context) error {
+// merely because literal legacy tags exist. The workspace marker is not part of
+// the legacy layout: it is neither created nor read here.
+func (wc *workspaceClient) checkLegacyWorkspace(ctx context.Context) (workspaceObservation, error) {
 	for _, tag := range []string{wc.stateTag, wc.lockTag, wc.unlockedTag, wc.versionTagFor(maxStateVersion)} {
 		if err := (orasProperties.Reference{Tag: tag}).ValidateTag(); err != nil {
-			return fmt.Errorf("invalid workspace tag: %w", err)
+			return workspaceObservation{}, fmt.Errorf("invalid workspace tag: %w", err)
 		}
 	}
 
 	// Existing legacy manifests already carry org.terraform.workspace. Verify
 	// our own mutable tags when present so compatibility does not weaken
 	// identity checking for state that already exists.
+	var obs workspaceObservation
 	for _, tag := range []string{wc.stateTag, wc.lockTag, wc.unlockedTag} {
 		m, _, err := wc.fetchManifestWithDesc(ctx, tag)
 		if isNotFound(err) {
 			continue
 		}
 		if err != nil {
-			return err
+			return obs, err
+		}
+		if tag == wc.stateTag {
+			obs.statePresent = true
 		}
 		if name := m.Annotations[annotationWorkspace]; name != "" && name != wc.stateID {
-			return fmt.Errorf("workspace identity mismatch at tag %q", tag)
+			return obs, fmt.Errorf("workspace identity mismatch at tag %q", tag)
 		}
 	}
-	return nil
+	return obs, nil
 }
 
 func listLegacyWorkspaces(ctx context.Context, repo *orasRepositoryClient) ([]string, error) {

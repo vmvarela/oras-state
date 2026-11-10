@@ -14,6 +14,7 @@ import (
 	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/oras-project/oras-go/v3/errdef"
 	orasProperties "github.com/oras-project/oras-go/v3/registry/remote/properties"
 )
 
@@ -26,7 +27,7 @@ func TestWorkspaceMappingRegression(t *testing.T) {
 	}
 	for _, name := range []string{strings.Repeat("a", 128), strings.Repeat("a", 129), "a/b", "ws-c14cddc033f64b9d", "日本語", "default"} {
 		wc := newWorkspaceClient(nil, name)
-		for _, tag := range []string{wc.stateTag, wc.lockTag, wc.unlockedTag, wc.versionTagFor(1), wc.versionTagFor(1 << 30), wc.versionTagFor(int(^uint(0) >> 1))} {
+		for _, tag := range []string{wc.stateTag, wc.lockTag, wc.unlockedTag, wc.markerTag, wc.versionTagFor(1), wc.versionTagFor(1 << 30), wc.versionTagFor(int(^uint(0) >> 1))} {
 			if err := (orasProperties.Reference{Tag: tag}).ValidateTag(); err != nil {
 				t.Errorf("workspace %q produces invalid tag %q: %v", name, tag, err)
 			}
@@ -146,7 +147,7 @@ func workspaceOperations(c *Client) map[string]func() error {
 }
 
 func TestWorkspaceRejectsLegacyRepository(t *testing.T) {
-	for _, tag := range []string{"state-default", "state-ws-c14cddc033f64b9d", "locked-default", "unlocked-default", "stver-default-v1"} {
+	for _, tag := range []string{"state-default", "state-ws-c14cddc033f64b9d", "locked-default", "unlocked-default", "wsmeta-default", "stver-default-v1"} {
 		t.Run(tag, func(t *testing.T) {
 			fake := newFakeORASRepo()
 			c := newTestClient(&orasRepositoryClient{inner: fake})
@@ -257,7 +258,17 @@ func TestWorkspaceUnverifiedVersionsNotTrusted(t *testing.T) {
 		if got, err := fake.Resolve(ctx, wc.versionTagFor(1)); err != nil || got.Digest != foreign.Digest {
 			t.Fatal("foreign version tag overwritten")
 		}
-		wantState(t, c, "default", "")
+		// The marker was published before the failed initialization: the
+		// workspace is marker-only and Get fails closed instead of returning nil.
+		if _, err := fake.Resolve(ctx, wc.stateTag); !errors.Is(err, errdef.ErrNotFound) {
+			t.Fatalf("state tag resolve = %v, want absent", err)
+		}
+		if _, err := fake.Resolve(ctx, wc.markerTag); err != nil {
+			t.Fatalf("marker after failed initialization: %v", err)
+		}
+		if _, err := c.Get(ctx, "default"); err == nil || !strings.Contains(err.Error(), "workspace marker") {
+			t.Fatalf("Get on marker-only state = %v, want fail-closed marker error", err)
+		}
 	})
 
 	t.Run("allocation fallback", func(t *testing.T) {
@@ -428,7 +439,7 @@ func TestWorkspacePreflightCallsBounded(t *testing.T) {
 	repo.tags.Store(0)
 	repo.resolve.Store(0)
 	repo.fetch.Store(0)
-	if err := newWorkspaceClient(c, "ws0").checkWorkspace(ctx); err != nil {
+	if _, err := newWorkspaceClient(c, "ws0").checkWorkspace(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if tags, resolve, fetch := repo.tags.Load(), repo.resolve.Load(), repo.fetch.Load(); tags != 1 || resolve > 3 || fetch > 3 {

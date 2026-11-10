@@ -7,7 +7,8 @@ that a concurrent writer had just attached to the same version.
 
 This is the investigation for [#28](https://github.com/vmvarela/oras-state/issues/28),
 reviewed on 2026-11-08 against `35ee4110bd6c35062f2671f2374ff960a8bc96b7`.
-It changes no engine behavior. **No implementation issue is proposed yet.**
+It changes no engine behavior. Follow-up [#33](https://github.com/vmvarela/oras-state/issues/33)
+remains blocked for product pruning.
 
 ## What deletion means
 
@@ -168,25 +169,67 @@ deliberately rather than observed in production.
 | Surviving manifests keep shared plain/gzip blobs readable | Live experiment, 2026-11-08 | Snapshot only; says nothing about reclamation timing |
 | A protected alias attached after enumeration is destroyed | Live experiment, 2026-11-08 | Reproduced deliberately, not sampled |
 
-The experiment described above satisfies the evidence requirement from the
-first version of this document; any future design needs its own repeat. Before
-reconsidering, use an explicitly authorized disposable GHCR package with an
-anchor version and synthetic state, and record package version IDs, complete tag
-sets, manifest/config/layer digests and payload hashes before and after each
-operation. It must cover multi-tag deletion; distinct current/kept
-history/other-workspace manifests sharing blobs (plain and gzip); unknown/legacy
-aliases; a protected alias added after enumeration; and write-only versus
-delete-capable credentials. Read survivors by tag and digest, including after
-propagation, and record actual statuses. Unit seams must additionally exercise
-pagination failures, stale metadata, tag moves and permission failures.
+The 2026-11-08 experiment established version-wide deletion, shared-blob
+survival in that snapshot, and the destructive late-alias race. The
+2026-11-10 follow-up in this document verified the Packages API tag metadata and
+showed that alias moves do not update `updated_at`; it also deleted only reviewed
+synthetic versions that remained untagged. Together these observations do not
+provide an atomic deletion condition or an exclusive-writer boundary.
 
-A passing snapshot experiment alone cannot prove future GC behavior or eliminate
-the alias race. Reconsider only with evidence for shared-layer preservation
-**and** an enforceable concurrency contract — the observed race means the second
-condition now requires a server-enforced precondition or an exclusive-writer
-boundary, not a recheck — then open a narrowly scoped implementation issue in
-`oras-state`. Until then, the decision is **no-go**: retain the
-automatic-pruning guard and the [README warning](../README.md#read-only-state-history).
+Any future proposal that changes the deletion mechanism still needs evidence for
+its specific safety claims: package-version IDs and complete tag sets, manifest
+and payload digests, multi-tag behavior, shared layers, unknown/legacy aliases,
+and permission/pagination failures. Read survivors by tag and digest after
+propagation. Do not repeat the destructive late-alias DELETE merely to reconfirm
+the already-observed data loss. A passing snapshot experiment alone cannot prove
+future GC behavior or eliminate the alias race.
+
+Reconsider product pruning only with evidence for shared-layer preservation
+**and** a server-enforced precondition or genuinely enforceable package-wide
+writer/retagger boundary; neither C's workspace witness, rechecks nor an age
+cutoff supplies that boundary. Issue #33 remains **no-go** until then: retain
+the automatic-pruning guard and the [README warning](../README.md#read-only-state-history).
+
+## Follow-up disposable-package experiment (2026-11-10)
+
+This authorized experiment checked the real Packages API metadata and the
+eligibility/deletion mechanics using only synthetic versions. It did not repeat
+the destructive late-alias deletion. The private package
+`ghcr.io/vmvarela/gc-experiment` and its tagged anchor were left in place.
+
+| Version ID | Digest | `created_at` / initial `updated_at` | Outcome |
+|---|---|---|---|
+| `1535333136` | `sha256:780abb9de17c4c4bdcc63b33e4ac3e5d7b5effe7f0eea66212873a1f0b35e3a5` | anchor | Preserved; final package version. |
+| `1535336780` | `sha256:9db8f9e8a2b246e173632e97336c88caa77b299ac8926ae09fedb45efa322c02` | `2026-11-10T11:24:16Z` | Synthetic; deleted after fresh complete inventory showed present tag metadata and `tags=[]`. |
+| `1535337032` | `sha256:678436a991950765b14d1925edd051b86421fb495f7da8deedab1c91f778c2bc` | `2026-11-10T11:24:19Z` | Synthetic; deleted after fresh complete inventory showed present tag metadata and `tags=[]`. |
+| `1535337265` | `sha256:9b846d49eea24610db10034c4aa2b5fa8a3262993831b91eef16336201469e49` | `2026-11-10T11:24:22Z` | Synthetic; initially tagged, then untagged and alias-race-tested non-destructively; deleted only after alias moved to anchor and a fresh inventory showed `tags=[]`. |
+
+The `metadata.container.tags` field was present as an array in the inspected
+snapshots. Adding and moving aliases did **not** change `updated_at`, so an age
+cutoff cannot detect a recent retag if the alias is subsequently moved away.
+The non-destructive race check added `late-alias` after enumeration, observed
+the candidate become tagged, then moved that alias to the anchor; the candidate
+became untagged again and the alias resolved to the anchor digest. The
+2026-11-08 destructive result above remains the evidence for what a late tagged
+DELETE does; it was not repeated.
+
+Each DELETE targeted one reviewed synthetic package-version ID. The candidate
+was re-enumerated immediately beforehand and checked against the generated
+ID/digest allowlist, complete tag metadata, empty tag list and experimental age
+cutoff. All three IDs disappeared; after 30 seconds the anchor was still the
+only package version, its payload hash remained
+`a7b986b73b7460c3bc2157401791cc816ade499e8961e25da05fdba2ecc4725a`, and its
+tags (`anchor`, `candidate-2`, `candidate-3`, `candidate-4`, `late-alias`) all
+resolved to its digest. The package remains private. No tagged version or
+package was deleted.
+
+This confirms the observed response fields and that individually deleting
+reviewed untagged synthetic versions leaves the anchor readable in this run.
+It does **not** make production pruning safe: tag-set checks still race with
+DELETE, `updated_at` does not change on retag, and an untagged manifest may have
+other references. The product prune API/CLI remains blocked; the workspace
+marker described in the code change is only a prospective recovery witness, not
+a deletion fence.
 
 [packages]: https://docs.github.com/en/rest/packages/packages#delete-package-version-for-an-organization
 [container-auth]: https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-to-the-container-registry
