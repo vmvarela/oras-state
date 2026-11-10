@@ -31,6 +31,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	oras "github.com/oras-project/oras-go/v3"
 	"github.com/oras-project/oras-go/v3/errdef"
+	orasRegistry "github.com/oras-project/oras-go/v3/registry"
 	orasErrcode "github.com/oras-project/oras-go/v3/registry/remote/errcode"
 	"golang.org/x/sync/errgroup"
 )
@@ -392,15 +393,18 @@ func (wc *workspaceClient) readStateManifest(ctx context.Context, reference stri
 
 // Put stores the state for the given stateID.
 //
-// Content-addressed steps (layer push, manifest pack, version read) are
-// idempotent/retried; the mutable state/version tag publications go through
-// publishMutableTag, so a transient tag response is never followed by a blind
-// re-apply: own digest ⇒ response-lost success, foreign digest ⇒ fail closed,
-// absent tag ⇒ fail closed (no re-apply: a Resolve(404)→Tag reapply is itself
-// a clobber window), ambiguous ⇒ fail closed. The old behavior — wrapping the
-// whole put in a retry that re-pushed and re-tagged with a fresh manifest
-// digest — is gone: it silently overwrote a rival's newer state because
-// ownership is verified only once, before the first Put.
+// Content-addressed steps (layer push, history-manifest pack, version read) are
+// idempotent/retried. The current-state publication is ONE tag-addressed
+// manifest PUT when the repository supports ORAS ReferencePusher
+// (publishCurrentState), and a content-addressed pack plus a tag PUT otherwise;
+// the history tag goes through publishMutableTag. Either way a transient tag
+// response is never followed by a blind re-apply: own digest ⇒ response-lost
+// success, foreign digest ⇒ fail closed, absent tag ⇒ fail closed (no
+// re-apply: a Resolve(404)→Tag reapply is itself a clobber window), ambiguous
+// ⇒ fail closed. The old behavior — wrapping the whole put in a retry that
+// re-pushed and re-tagged with a fresh manifest digest — is gone: it silently
+// overwrote a rival's newer state because ownership is verified only once,
+// before the first Put.
 func (c *Client) Put(ctx context.Context, stateID string, data []byte) error {
 	ctx, cancel := c.opContext(ctx)
 	defer cancel()
@@ -490,18 +494,11 @@ func (wc *workspaceClient) put(ctx context.Context, state []byte) error {
 	if nextVersion > 0 {
 		annotations[annotationStateVersion] = strconv.Itoa(nextVersion)
 	}
-	// C: the current manifest, published under the state tag. It carries NO
-	// history marker.
-	manifestDesc, err := retryWithResult(ctx, func(ctx context.Context) (ocispec.Descriptor, error) {
-		return wc.packStateManifestAnnotated(ctx, []ocispec.Descriptor{layerDesc}, annotations)
-	})
-	if err != nil {
-		return err
-	}
-
-	// H: the distinct history manifest for the version tag, PREPARED (layer
-	// and both manifests pushed, content-addressed) before current is
-	// published — a history-pack failure leaves the current tag untouched.
+	// H: the distinct history manifest for the version tag, PREPARED (packed
+	// and pushed, content-addressed) before current is published — a
+	// history-pack failure leaves the current tag untouched. H is prepared
+	// first because publishing current may be a single tag-addressed PUT
+	// (publishCurrentState), which cannot be split from its pack.
 	// The dedicated history marker guarantees C and H digests differ even
 	// when layer, bytes and timestamps are identical, and lets retention
 	// prove a candidate manifest is history before deleting it.
@@ -518,7 +515,10 @@ func (wc *workspaceClient) put(ctx context.Context, state []byte) error {
 		}
 	}
 
-	if err := wc.publishMutableTag(ctx, manifestDesc, wc.stateTag); err != nil {
+	// C: the current manifest, published under the state tag. It carries NO
+	// history marker. manifestDesc is needed by async retention below.
+	manifestDesc, err := wc.publishCurrentState(ctx, []ocispec.Descriptor{layerDesc}, annotations)
+	if err != nil {
 		return err
 	}
 
@@ -1424,6 +1424,83 @@ func (wc *workspaceClient) packStateManifestAnnotated(ctx context.Context, layer
 		Layers:              layers,
 		ManifestAnnotations: annotations,
 	})
+}
+
+// taggableRepository is the ORAS Target + ReferencePusher combination
+// PackManifestN needs to publish a manifest under a tag in ONE tag-addressed
+// PUT. The minimal orasRepository interface does not require it (minimal test
+// doubles do not implement it), so it is asserted at runtime: a real remote
+// repository has it.
+type taggableRepository interface {
+	oras.Target
+	orasRegistry.ReferencePusher
+}
+
+// discardPusher lets PackManifest compute a manifest's descriptor — and
+// therefore its digest — without publishing it. PackManifestN returns an empty
+// descriptor on push error, and response-loss observation needs the expected
+// digest up front.
+type discardPusher struct{}
+
+func (discardPusher) Push(context.Context, ocispec.Descriptor, io.Reader) error { return nil }
+
+// publishCurrentState publishes C, the current-state manifest, under the state
+// tag and returns its descriptor (async retention needs it).
+//
+// When the repository implements ORAS ReferencePusher (a real remote
+// repository does), the manifest is packed and published with ONE
+// tag-addressed manifest PUT (PackManifestN): no digest-addressed manifest is
+// written first, so a failed or lost tag PUT cannot leave an untagged manifest
+// behind. That single PUT is deliberately NOT wrapped in the content-addressed
+// retry: a transient failure is resolved by observing the tag with the
+// pre-computed expected digest, never by re-applying it (observeMutableTag).
+//
+// Otherwise the repository falls back to the existing path — a
+// content-addressed pack (retried) plus a separate tag PUT through
+// publishMutableTag. That is TWO registry operations, not one PUT; nothing
+// here claims otherwise. This is not CAS on either path.
+//
+// Callers must pass a fixed annotationCreated (put does): the expected digest
+// is computed by packing once more, so an absent created stamp would make the
+// two packs mint different digests.
+func (wc *workspaceClient) publishCurrentState(ctx context.Context, layers []ocispec.Descriptor, annotations map[string]string) (ocispec.Descriptor, error) {
+	opts := oras.PackManifestOptions{
+		Layers:              layers,
+		ManifestAnnotations: annotations,
+	}
+	target, ok := wc.client.repoClient.inner.(taggableRepository)
+	if !ok {
+		desc, err := retryWithResult(ctx, func(ctx context.Context) (ocispec.Descriptor, error) {
+			return wc.packStateManifestAnnotated(ctx, layers, annotations)
+		})
+		if err != nil {
+			return ocispec.Descriptor{}, err
+		}
+		if err := wc.publishMutableTag(ctx, desc, wc.stateTag); err != nil {
+			return ocispec.Descriptor{}, err
+		}
+		return desc, nil
+	}
+
+	expected, err := oras.PackManifest(ctx, discardPusher{}, oras.PackManifestVersion1_1, artifactTypeState, opts)
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	desc, err := oras.PackManifestN(ctx, target, oras.PackManifestVersion1_1, artifactTypeState, []string{wc.stateTag}, opts)
+	if err == nil {
+		return desc, nil
+	}
+	if !isTransientError(err) {
+		return ocispec.Descriptor{}, err
+	}
+	// Transient failure: the manifest PUT may have landed with its response
+	// lost. Observe the tag; never re-publish. (A transient content push
+	// inside PackManifestN lands here too and fails closed, which is safe but
+	// imprecise: no tag PUT was issued in that case.)
+	if err := wc.observeMutableTag(ctx, expected, wc.stateTag, err); err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	return expected, nil
 }
 
 // packLockManifest builds a lock manifest. holderID doubles as the lock ID
