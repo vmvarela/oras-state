@@ -13,7 +13,7 @@ import (
 // The full tag and the original-name annotation must both validate: a legacy
 // literal name can look exactly like a SHA-256 identifier.
 func workspaceIDFromTag(tag string) (string, bool) {
-	for _, prefix := range []string{stateTagPrefix, lockTagPrefix, unlockedTagPrefix} {
+	for _, prefix := range []string{stateTagPrefix, lockTagPrefix, unlockedTagPrefix, markerTagPrefix} {
 		if strings.HasPrefix(tag, prefix) {
 			return strings.TrimPrefix(tag, prefix), true
 		}
@@ -74,10 +74,22 @@ func repositoryWorkspaceIdentities(ctx context.Context, repo *orasRepositoryClie
 	}
 	identities := make(map[string]string)
 	for _, tag := range tags {
-		name, err := workspaceNameFromTag(ctx, repo, tag)
-		if isNotFound(err) {
-			// Concurrent deletion: no object remains to inspect.
-			continue
+		var name string
+		var err error
+		if strings.HasPrefix(tag, markerTagPrefix) {
+			// A marker is evidence only when its identity, exact artifact
+			// type, and empty layer list all validate; List must not hide a
+			// malformed marker as a concurrently deleted one.
+			name, err = workspaceMarkerNameFromTag(ctx, repo, tag)
+			if isNotFound(err) && !isMissingContent(err) {
+				continue
+			}
+		} else {
+			name, err = workspaceNameFromTag(ctx, repo, tag)
+			if isNotFound(err) {
+				// Concurrent deletion: no object remains to inspect.
+				continue
+			}
 		}
 		if err != nil {
 			return nil, err
@@ -95,25 +107,61 @@ func validateWorkspaceManifest(m ocispec.Manifest, tag, workspace string) error 
 	return nil
 }
 
+// validateWorkspaceMarker checks the exact marker identity used as evidence or
+// as a deletion target: the original-name annotation must match, the artifact
+// type must be the marker's own, and the manifest must carry no layers.
+func validateWorkspaceMarker(m ocispec.Manifest, tag, workspace string) error {
+	if err := validateWorkspaceManifest(m, tag, workspace); err != nil {
+		return err
+	}
+	if m.ArtifactType != artifactTypeWorkspaceMarker {
+		return fmt.Errorf("unexpected workspace marker artifactType %q for %q", m.ArtifactType, tag)
+	}
+	if len(m.Layers) != 0 {
+		return fmt.Errorf("workspace marker %q has %d layers; expected none", tag, len(m.Layers))
+	}
+	return nil
+}
+
+// workspaceObservation is the per-operation view of the repository listing.
+// It is neither CAS nor authoritative absence: tags can move after the listing.
+type workspaceObservation struct {
+	statePresent  bool
+	markerPresent bool
+}
+
 // checkWorkspace is a preflight, NOT CAS. It neither fences old binaries nor
 // closes the existing verify-to-write window. Never cache its registry result.
 // Scoped per ADR-0002 Amendment 1: names repo-wide, annotations only for own mutable tags.
-func (wc *workspaceClient) checkWorkspace(ctx context.Context) error {
+//
+// It returns the listing-derived observation so callers can reuse current-tag
+// and marker presence without a second listing. Marker manifests are NOT read
+// here: the marker is validated only where it is used as evidence or deleted,
+// so Unlock/VerifyLock/history reads stay usable on marker-only state.
+func (wc *workspaceClient) checkWorkspace(ctx context.Context) (workspaceObservation, error) {
 	if wc.client.config.WorkspaceLayout == WorkspaceLayoutLegacy {
 		return wc.checkLegacyWorkspace(ctx)
 	}
 
-	for _, tag := range []string{wc.stateTag, wc.lockTag, wc.unlockedTag, wc.versionTagFor(maxStateVersion)} {
+	for _, tag := range []string{wc.stateTag, wc.lockTag, wc.unlockedTag, wc.markerTag, wc.versionTagFor(maxStateVersion)} {
 		if err := (orasProperties.Reference{Tag: tag}).ValidateTag(); err != nil {
-			return fmt.Errorf("invalid workspace tag: %w", err)
+			return workspaceObservation{}, fmt.Errorf("invalid workspace tag: %w", err)
 		}
 	}
 	tags, err := reservedWorkspaceTags(ctx, wc.client.repoClient)
 	if err != nil {
-		return err
+		return workspaceObservation{}, err
 	}
+	var obs workspaceObservation
 	for _, tag := range tags {
-		if tag != wc.stateTag && tag != wc.lockTag && tag != wc.unlockedTag {
+		switch tag {
+		case wc.stateTag:
+			obs.statePresent = true
+		case wc.markerTag:
+			obs.markerPresent = true
+			continue
+		case wc.lockTag, wc.unlockedTag:
+		default:
 			continue
 		}
 		name, err := workspaceNameFromTag(ctx, wc.client.repoClient, tag)
@@ -122,11 +170,11 @@ func (wc *workspaceClient) checkWorkspace(ctx context.Context) error {
 			continue
 		}
 		if err != nil {
-			return err
+			return obs, err
 		}
 		if name != wc.stateID {
-			return fmt.Errorf("workspace identity mismatch at tag %q; stop writers and restore verified metadata (see docs/guides/workspace-migration.md)", tag)
+			return obs, fmt.Errorf("workspace identity mismatch at tag %q; stop writers and restore verified metadata (see docs/guides/workspace-migration.md)", tag)
 		}
 	}
-	return nil
+	return obs, nil
 }

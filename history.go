@@ -38,7 +38,7 @@ func (c *Client) ListVersions(ctx context.Context, stateID string) ([]StateVersi
 	defer cancel()
 
 	wc := newWorkspaceClient(c, stateID)
-	if err := wc.checkWorkspace(ctx); err != nil {
+	if _, err := wc.checkWorkspace(ctx); err != nil {
 		return nil, err
 	}
 
@@ -97,7 +97,7 @@ func (c *Client) GetVersion(ctx context.Context, stateID string, version int) ([
 	defer cancel()
 
 	wc := newWorkspaceClient(c, stateID)
-	if err := wc.checkWorkspace(ctx); err != nil {
+	if _, err := wc.checkWorkspace(ctx); err != nil {
 		return nil, err
 	}
 

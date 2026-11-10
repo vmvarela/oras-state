@@ -41,6 +41,7 @@ func newRemoteClient(repo *orasRepositoryClient, workspace string) *workspaceCli
 		versionTagBase: stateVersionTagPrefix + wsTag,
 		lockTag:        lockTagPrefix + wsTag,
 		unlockedTag:    unlockedTagPrefix + wsTag,
+		markerTag:      markerTagPrefix + wsTag,
 	}
 }
 

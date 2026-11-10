@@ -83,7 +83,7 @@ defer client.Unlock(ctx, "default", lockID)
 
 Callers may also provide their own HTTP client or use `BuildHTTPClient` for TLS verification, custom CAs, or explicit skip-verification behavior.
 
-`Get` returns `nil` state when the current tag is absent. If a tag resolves but its manifest or layer content is missing, `Get` returns an error instead of reporting the state as absent.
+In the default hashed layout, `Get` returns `nil` when both the current-state tag and its workspace marker are absent. If the current-state tag is absent but a valid marker exists, it returns an error instead of reporting the state as absent. This detects missing state for workspaces that have been marked; it does not cover older workspaces until their next successful `Put`. If a tag resolves but its manifest or layer content is missing, `Get` also returns an error. `WorkspaceLayoutLegacy` keeps its historical behavior.
 
 ## Read-only state history
 
@@ -134,6 +134,8 @@ A `PartialPublicationError` means the main state tag was published at the time o
 ## Workspace layout
 
 The default layout hashes every logical state/workspace name using full SHA-256 before constructing OCI tags. This avoids collisions and keeps arbitrary logical names independent from registry tag syntax.
+
+On the default layout, the first `Put` publishes a small, internal `wsmeta-` workspace marker before publishing state. If marker publication fails, `Put` fails without publishing state. If initialization then fails, the marker remains; `Get` fails closed and `Put`/`Lock` refuse to treat the workspace as new. Recover the state or explicitly reset the workspace with `Delete`/`DeleteWorkspace`. The marker is prospective recovery evidence, not a transaction or lock: it does not fence concurrent writers, and it cannot identify an older workspace whose state disappeared before that workspace was marked. `Lock`, `Unlock`, and history reads do not create or require the marker.
 
 `WorkspaceLayoutLegacy` exists only for compatibility with repositories created by the historical layout. New consumers should use the default hashed layout.
 

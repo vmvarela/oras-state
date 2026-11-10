@@ -684,8 +684,8 @@ func TestGHCR_AutomaticRetentionDisabledHistoryReadable(t *testing.T) {
 	if deletes != 0 || deletesAfterV1 != 0 || deletesAfterPuts != 0 {
 		t.Errorf("Delete calls = %d (v1: %d, after v2: %d), want 0 (no automatic retention on ghcr.io)", deletes, deletesAfterV1, deletesAfterPuts)
 	}
-	if tags != tagsAfterPuts || tags != 4 {
-		t.Errorf("Tag calls = %d (right after publications: %d), want exactly 4 publication tags (2 per Put) and no retention tag cleanup", tags, tagsAfterPuts)
+	if tags != tagsAfterPuts || tags != 5 {
+		t.Errorf("Tag calls = %d (right after publications: %d), want exactly 5 publication tags (marker+state+history on the first Put, state+history on the second) and no retention tag cleanup", tags, tagsAfterPuts)
 	}
 
 	// History is still published and readable; current is intact.
@@ -875,6 +875,11 @@ func TestPut_PartialPublicationErrorAndRecovery(t *testing.T) {
 	got, gerr := c.Get(ctx, "default")
 	if gerr != nil || string(got) != "state-v1" {
 		t.Fatalf("Get after partial publication = (%q, %v), want the published state", got, gerr)
+	}
+	// The marker was published before the state and survives the partial
+	// publication; it must not turn a readable state into a marker-only error.
+	if _, err := fake.Resolve(ctx, markerTagPrefix+workspaceTagFor("default")); err != nil {
+		t.Fatalf("workspace marker after partial publication: %v", err)
 	}
 	// The failed version tag was never re-applied or deleted.
 	if _, rerr := fake.Resolve(ctx, versionTag); !errors.Is(rerr, errdef.ErrNotFound) {
