@@ -62,6 +62,10 @@ func (h *hookingRepo) Fetch(ctx context.Context, target ocispec.Descriptor) (io.
 	return h.inner.Fetch(ctx, target)
 }
 
+func (h *hookingRepo) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
+	return h.inner.Exists(ctx, target)
+}
+
 func (h *hookingRepo) Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error) {
 	h.mu.Lock()
 	matched := reference == h.watch
@@ -382,6 +386,10 @@ func (g *gateResolveRepo) Push(ctx context.Context, expected ocispec.Descriptor,
 
 func (g *gateResolveRepo) Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error) {
 	return g.inner.Fetch(ctx, target)
+}
+
+func (g *gateResolveRepo) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
+	return g.inner.Exists(ctx, target)
 }
 
 func (g *gateResolveRepo) Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error) {

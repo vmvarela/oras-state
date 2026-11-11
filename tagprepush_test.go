@@ -137,6 +137,17 @@ func (s *tagRetryServer) record(method, reference string) {
 }
 
 func (s *tagRetryServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Blobs are treated as already present: the single-PUT tests publish only a
+	// manifest, and PackManifest skips an existing config blob. A HEAD reply
+	// must carry Content-Length for ORAS to build the descriptor.
+	if r.Method == http.MethodHead && strings.HasPrefix(r.URL.Path, "/v2/test/repo/blobs/") {
+		dgst := strings.TrimPrefix(r.URL.Path, "/v2/test/repo/blobs/")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("Docker-Content-Digest", dgst)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	const prefix = "/v2/test/repo/manifests/"
 	if !strings.HasPrefix(r.URL.Path, prefix) || strings.Contains(strings.TrimPrefix(r.URL.Path, prefix), "/") {
 		http.Error(w, `{"errors":[{"code":"NAME_UNKNOWN","message":"repository name not known to registry"}]}`, http.StatusNotFound)

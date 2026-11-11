@@ -147,6 +147,7 @@ type Client struct {
 type orasRepository interface {
 	Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error
 	Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error)
+	Exists(ctx context.Context, target ocispec.Descriptor) (bool, error)
 	Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error)
 	Tag(ctx context.Context, desc ocispec.Descriptor, reference string) error
 	Delete(ctx context.Context, target ocispec.Descriptor) error

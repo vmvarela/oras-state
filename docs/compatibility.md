@@ -23,7 +23,7 @@ Workspace/state identity mapping is exercised live on Zot (`TestZotWorkspaceIsol
 
 ### Zot
 
-The mandatory CI target. Tests run PlainHTTP without authentication, using either Docker (`ghcr.io/project-zot/zot-linux-amd64:v2.1.0`) or a native binary via `TF_ORAS_ZOT_BINARY`. Full state lifecycle, locking, retention, compression, history, workspace isolation and concurrent-writer behavior are covered.
+The mandatory CI target. Tests run PlainHTTP without authentication, using either Docker (`ghcr.io/project-zot/zot-linux-amd64:v2.1.0`) or a native binary via `TF_ORAS_ZOT_BINARY`. Full state lifecycle, locking, retention, compression, history, workspace isolation, concurrent-writer behavior, and repository copy are covered.
 
 ### GitHub Container Registry (ghcr.io)
 
@@ -81,4 +81,5 @@ TF_ORAS_HARBOR_TEST=1 \
 
 - No live TLS/custom-CA suite (unit coverage only).
 - Large state is validated live on Zot (2 MiB); GHCR and Harbor are not exercised with large states.
+- Repository copy (`PlanCopy`/`CopyTo`) is exercised on Zot only; GHCR and Harbor copies are untested.
 - Harbor validation is manual/opt-in, not part of CI.
