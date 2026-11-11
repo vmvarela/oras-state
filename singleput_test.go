@@ -231,66 +231,6 @@ func TestPutCurrentStateFailedPushReferenceFailsClosed(t *testing.T) {
 	}
 }
 
-// digestPackTrackingRepo records digest-addressed manifest pushes and tag
-// writes. It deliberately does NOT implement ReferencePusher, so the fallback
-// path is exercised.
-type digestPackTrackingRepo struct {
-	delegatingRepo
-
-	mu             sync.Mutex
-	manifestPushes []digest.Digest
-	tags           []string
-}
-
-func (r *digestPackTrackingRepo) Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
-	b, err := io.ReadAll(content)
-	if err != nil {
-		return err
-	}
-	r.mu.Lock()
-	if expected.MediaType == ocispec.MediaTypeImageManifest {
-		r.manifestPushes = append(r.manifestPushes, expected.Digest)
-	}
-	r.mu.Unlock()
-	return r.inner.Push(ctx, expected, bytes.NewReader(b))
-}
-
-func (r *digestPackTrackingRepo) Tag(ctx context.Context, desc ocispec.Descriptor, reference string) error {
-	r.mu.Lock()
-	r.tags = append(r.tags, reference)
-	r.mu.Unlock()
-	return r.inner.Tag(ctx, desc, reference)
-}
-
-// TestPutCurrentStateFallbackIsNotOnePut — without ReferencePusher the current
-// state still publishes correctly, but through TWO operations (digest pack +
-// separate tag PUT). The fallback must not pretend to be a single PUT.
-func TestPutCurrentStateFallbackIsNotOnePut(t *testing.T) {
-	ctx := context.Background()
-	fake := newFakeORASRepo()
-	track := &digestPackTrackingRepo{delegatingRepo: delegatingRepo{inner: fake}}
-	repo := &orasRepositoryClient{inner: track, repository: "example.com/test/repo"}
-	c := newTestClient(repo)
-	wc := newRemoteClient(repo, "default")
-
-	if err := c.Put(ctx, "default", []byte("state-fallback")); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	if got, err := c.Get(ctx, "default"); err != nil || string(got) != "state-fallback" {
-		t.Fatalf("Get = (%q, %v)", got, err)
-	}
-	current := mustResolve(ctx, t, fake, wc.stateTag)
-
-	track.mu.Lock()
-	defer track.mu.Unlock()
-	if !containsDigest(track.manifestPushes, current.Digest) {
-		t.Errorf("current manifest %s was not pushed at its digest; the fallback must keep the content-addressed pack", current.Digest)
-	}
-	if !containsRef(track.tags, wc.stateTag) {
-		t.Errorf("Tag refs = %v, want the separate current tag PUT %s", track.tags, wc.stateTag)
-	}
-}
-
 // TestPublishCurrentStateSingleManifestPUTOverHTTP — the pinned ORAS remote
 // repository against a minimal OCI Distribution fixture: publishing C issues
 // exactly ONE manifest PUT, at the mutable state tag, with no digest-addressed

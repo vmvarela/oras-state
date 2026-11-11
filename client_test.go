@@ -19,6 +19,7 @@ import (
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	oras "github.com/oras-project/oras-go/v3"
 	"github.com/oras-project/oras-go/v3/errdef"
 	orasErrcode "github.com/oras-project/oras-go/v3/registry/remote/errcode"
 )
@@ -63,6 +64,10 @@ type delegatingRepo struct {
 
 func (r *delegatingRepo) Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
 	return r.inner.Push(ctx, expected, content)
+}
+
+func (r *delegatingRepo) PushReference(ctx context.Context, expected ocispec.Descriptor, content io.Reader, reference string) error {
+	return r.inner.PushReference(ctx, expected, content, reference)
 }
 
 func (r *delegatingRepo) Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error) {
@@ -263,6 +268,11 @@ func (r *blockingRepo) Fetch(ctx context.Context, target ocispec.Descriptor) (io
 }
 
 func (r *blockingRepo) Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (r *blockingRepo) PushReference(ctx context.Context, expected ocispec.Descriptor, content io.Reader, reference string) error {
 	<-ctx.Done()
 	return ctx.Err()
 }
@@ -564,10 +574,10 @@ func TestDelete_GHCRFallbackCallsPackagesAPI(t *testing.T) {
 	})}
 	unsupportedRepo := &deleteUnsupportedRepo{delegatingRepo: delegatingRepo{inner: fake}}
 	repo := &orasRepositoryClient{
-		inner:      unsupportedRepo,
-		repository: "ghcr.io/myorg/myrepo",
-		token:      "tok-123",
-		httpClient: ghcrClient,
+		inner:        unsupportedRepo,
+		repository:   "ghcr.io/myorg/myrepo",
+		credentialFn: resolveCredentials("ghcr.io", Config{Token: "tok-123"}),
+		httpClient:   ghcrClient,
 	}
 
 	client := newTestClient(repo)
@@ -989,7 +999,7 @@ func TestRemoteClient_Put_RejectsOversizedState(t *testing.T) {
 	c := newRemoteClient(&orasRepositoryClient{inner: fake}, "default")
 	c.client.config.MaxStateSize = 10
 
-	err := c.put(ctx, []byte("this state is longer than ten bytes"))
+	err := c.client.Put(ctx, "default", []byte("this state is longer than ten bytes"))
 	if err == nil {
 		t.Fatal("expected error for oversized state, got nil")
 	}
@@ -2322,5 +2332,211 @@ func BenchmarkDecompressGzip(b *testing.B) {
 		}
 		_, _ = io.ReadAll(gz)
 		_ = gz.Close()
+	}
+}
+
+func TestLockAndUnlock_RejectEmptyID(t *testing.T) {
+	ctx := context.Background()
+	c := newTestClient(&orasRepositoryClient{inner: newFakeORASRepo()})
+
+	if _, err := c.Lock(ctx, "default", LockInfo{}); err == nil {
+		t.Fatal("Lock with empty ID must fail")
+	}
+	lockID, err := c.Lock(ctx, "default", LockInfo{ID: "holder-1"})
+	if err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	if err := c.Unlock(ctx, "default", ""); err == nil {
+		t.Fatal("Unlock with empty ID must not force-unlock an active holder")
+	}
+	if err := c.VerifyLock(ctx, "default", lockID); err != nil {
+		t.Fatalf("VerifyLock after rejected empty Unlock: %v", err)
+	}
+}
+
+func TestLock_FailsClosedOnCorruptLockGenerationMetadata(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	c := newTestClient(&orasRepositoryClient{inner: fake})
+	wc := newWorkspaceClient(c, "default")
+
+	desc, err := oras.PackManifest(ctx, fake, oras.PackManifestVersion1_1, artifactTypeLock, oras.PackManifestOptions{
+		ManifestAnnotations: map[string]string{
+			annotationWorkspace: "default",
+			annotationLockID:    "",
+			annotationLockInfo:  "",
+			annotationLockGen:   "{not-json",
+		},
+	})
+	if err != nil {
+		t.Fatalf("PackManifest: %v", err)
+	}
+	if err := fake.Tag(ctx, desc, wc.lockTag); err != nil {
+		t.Fatalf("Tag: %v", err)
+	}
+
+	if _, err := c.Lock(ctx, "default", LockInfo{ID: "holder-1"}); err == nil {
+		t.Fatal("Lock must fail closed when existing lock generation metadata is corrupt")
+	}
+}
+
+func TestLock_LostRaceWrapsErrStateLocked(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	c := newTestClient(&orasRepositoryClient{inner: fake})
+	wc := newWorkspaceClient(c, "default")
+
+	rivalDesc, err := wc.packLockManifest(ctx, `{"ID":"rival"}`, 9, 0, "rival")
+	if err != nil {
+		t.Fatalf("packLockManifest: %v", err)
+	}
+	hook := &lockRaceOverwriteRepo{fakeORASRepo: fake, lockTag: wc.lockTag, rivalDesc: rivalDesc}
+	raced := newTestClient(&orasRepositoryClient{inner: hook})
+
+	_, err = raced.Lock(ctx, "default", LockInfo{ID: "me"})
+	if !errors.Is(err, errStateLocked) {
+		t.Fatalf("lost-race Lock error = %v, want errors.Is(err, errStateLocked)", err)
+	}
+}
+
+type lockRaceOverwriteRepo struct {
+	*fakeORASRepo
+	lockTag   string
+	rivalDesc ocispec.Descriptor
+}
+
+func (r *lockRaceOverwriteRepo) Tag(ctx context.Context, desc ocispec.Descriptor, reference string) error {
+	if err := r.fakeORASRepo.Tag(ctx, desc, reference); err != nil {
+		return err
+	}
+	if reference == r.lockTag {
+		return r.fakeORASRepo.Tag(ctx, r.rivalDesc, reference)
+	}
+	return nil
+}
+
+func TestGet_RejectsZeroAndMultiLayerStateManifests(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	c := newTestClient(&orasRepositoryClient{inner: fake})
+	wc := newWorkspaceClient(c, "default")
+
+	if err := c.Put(ctx, "default", []byte("initial")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	zeroManifest, err := json.Marshal(ocispec.Manifest{
+		ArtifactType: artifactTypeState,
+		Config:       ocispec.DescriptorEmptyJSON,
+		Annotations:  map[string]string{annotationWorkspace: "default"},
+	})
+	if err != nil {
+		t.Fatalf("Marshal zero-layer manifest: %v", err)
+	}
+	zeroDesc, err := oras.PushBytes(ctx, fake, ocispec.MediaTypeImageManifest, zeroManifest)
+	if err != nil {
+		t.Fatalf("PushBytes zero-layer manifest: %v", err)
+	}
+	if err := fake.Tag(ctx, zeroDesc, wc.stateTag); err != nil {
+		t.Fatalf("Tag zero-layer manifest: %v", err)
+	}
+	if got, err := c.Get(ctx, "default"); err == nil {
+		t.Fatalf("Get on 0-layer state manifest = %q, nil; want error", got)
+	}
+
+	l1, err := oras.PushBytes(ctx, fake, mediaTypeStateLayer, []byte("a"))
+	if err != nil {
+		t.Fatalf("PushBytes l1: %v", err)
+	}
+	l2, err := oras.PushBytes(ctx, fake, mediaTypeStateLayer, []byte("b"))
+	if err != nil {
+		t.Fatalf("PushBytes l2: %v", err)
+	}
+	twoDesc, err := oras.PackManifest(ctx, fake, oras.PackManifestVersion1_1, artifactTypeState, oras.PackManifestOptions{
+		Layers:              []ocispec.Descriptor{l1, l2},
+		ManifestAnnotations: map[string]string{annotationWorkspace: "default"},
+	})
+	if err != nil {
+		t.Fatalf("PackManifest 2-layer: %v", err)
+	}
+	if err := fake.Tag(ctx, twoDesc, wc.stateTag); err != nil {
+		t.Fatalf("Tag 2-layer: %v", err)
+	}
+	if got, err := c.Get(ctx, "default"); err == nil {
+		t.Fatalf("Get on 2-layer state manifest = %q, nil; want error", got)
+	}
+}
+
+func TestGet_VerifiesStateAndManifestDigests(t *testing.T) {
+	ctx := context.Background()
+
+	for _, compressed := range []bool{false, true} {
+		fake := newFakeORASRepo()
+		c := newTestClient(&orasRepositoryClient{inner: fake})
+		c.config.Compression = compressed
+		wc := newWorkspaceClient(c, "default")
+
+		payload := []byte("aaaa")
+		if err := c.Put(ctx, "default", payload); err != nil {
+			t.Fatalf("Put(compressed=%v): %v", compressed, err)
+		}
+
+		manifestDesc, err := fake.Resolve(ctx, wc.stateTag)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fm ocispec.Manifest
+		fake.mu.Lock()
+		_ = json.Unmarshal(fake.blobs[manifestDesc.Digest], &fm)
+		layerDigest := fm.Layers[0].Digest
+		origLayer := append([]byte(nil), fake.blobs[layerDigest]...)
+		if compressed {
+			// Valid gzip + CRC32 of identical compressed size, but wrong SHA-256 digest.
+			swapped, err := compressGzip([]byte("bbbb"))
+			if err != nil || len(swapped) != len(origLayer) {
+				fake.mu.Unlock()
+				t.Fatalf("compressGzip replacement len=%d (orig=%d), err=%v", len(swapped), len(origLayer), err)
+			}
+			fake.blobs[layerDigest] = swapped
+		} else {
+			fake.blobs[layerDigest] = []byte("bbbb")
+		}
+		fake.mu.Unlock()
+
+		if _, err := c.Get(ctx, "default"); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+			t.Fatalf("Get(compressed=%v) with swapped layer = %v, want digest mismatch", compressed, err)
+		}
+
+		// Restore layer and corrupt manifest bytes while keeping byte length unchanged.
+		fake.mu.Lock()
+		fake.blobs[layerDigest] = origLayer
+		fake.blobs[manifestDesc.Digest][len(fake.blobs[manifestDesc.Digest])-1] ^= 0x01
+		fake.mu.Unlock()
+
+		if _, err := c.Get(ctx, "default"); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+			t.Fatalf("Get(compressed=%v) with corrupted manifest = %v, want digest mismatch", compressed, err)
+		}
+	}
+}
+
+type notFoundOnDeleteRepo struct {
+	*fakeORASRepo
+}
+
+func (r *notFoundOnDeleteRepo) Delete(context.Context, ocispec.Descriptor) error {
+	return errdef.ErrNotFound
+}
+
+func TestUnlock_TreatsAlreadyDeletedLockAsSuccess(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	c := newTestClient(&orasRepositoryClient{inner: &notFoundOnDeleteRepo{fake}})
+
+	id, err := c.Lock(ctx, "default", LockInfo{ID: "holder-1"})
+	if err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	if err := c.Unlock(ctx, id, "default"); err != nil {
+		t.Fatalf("Unlock when Delete returns 404 = %v, want nil", err)
 	}
 }

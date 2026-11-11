@@ -83,6 +83,8 @@ defer client.Unlock(ctx, "default", lockID)
 
 Callers may also provide their own HTTP client or use `BuildHTTPClient` for TLS verification, custom CAs, or explicit skip-verification behavior.
 
+`LockTTL` sets a fixed lease duration written at lock acquisition time: leases are **not** renewed automatically while an operation runs. Set `LockTTL` longer than the longest expected run so `VerifyLock` does not expire mid-apply (or leave `LockTTL` at `0` so locks never expire automatically). Both `Lock` and `Unlock` require a non-empty lock ID.
+
 In the default hashed layout, `Get` returns `nil` when both the current-state tag and its workspace marker are absent. If the current-state tag is absent but a valid marker exists, it returns an error instead of reporting the state as absent. This detects missing state for workspaces that have been marked; it does not cover older workspaces until their next successful `Put`. If a tag resolves but its manifest or layer content is missing, `Get` also returns an error. `WorkspaceLayoutLegacy` keeps its historical behavior.
 
 ## Read-only state history
@@ -138,7 +140,7 @@ fmt.Printf("copied %d, already present %d, verified %d\n",
     len(report.Copied), len(report.Existing), len(report.Verified))
 ```
 
-`PlanCopy` pins every source tag and its current digest, so `CopyTo` copies exactly that snapshot. `CopyTo` copies each tagged graph, re-resolves every destination tag, walks its graph again, and re-checks both tag inventories before reporting success.
+`PlanCopy` pins every source tag and its current digest into an immutable `CopyPlan` (inspectable via `plan.Source()`, `plan.Artifacts()`, and `plan.Skipped()`), so `CopyTo` copies exactly that snapshot. `CopyTo` copies each tagged graph, re-resolves every destination tag, walks its graph again, and re-checks both tag inventories before reporting success.
 
 What the copy does and does not do:
 

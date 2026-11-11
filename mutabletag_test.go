@@ -58,6 +58,16 @@ func (h *hookingRepo) Push(ctx context.Context, expected ocispec.Descriptor, con
 	return h.inner.Push(ctx, expected, content)
 }
 
+func (h *hookingRepo) PushReference(ctx context.Context, expected ocispec.Descriptor, content io.Reader, reference string) error {
+	if err := h.inner.Push(ctx, expected, content); err != nil {
+		return err
+	}
+	if _, err := digest.Parse(reference); err == nil {
+		return nil
+	}
+	return h.Tag(ctx, expected, reference)
+}
+
 func (h *hookingRepo) Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error) {
 	return h.inner.Fetch(ctx, target)
 }
@@ -382,6 +392,10 @@ type gateResolveRepo struct {
 
 func (g *gateResolveRepo) Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
 	return g.inner.Push(ctx, expected, content)
+}
+
+func (g *gateResolveRepo) PushReference(ctx context.Context, expected ocispec.Descriptor, content io.Reader, reference string) error {
+	return g.inner.PushReference(ctx, expected, content, reference)
 }
 
 func (g *gateResolveRepo) Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error) {

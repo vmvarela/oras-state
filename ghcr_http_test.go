@@ -673,10 +673,10 @@ func TestTryDeleteGHCRTag_PassesTokenAndClientToGitHubAPI(t *testing.T) {
 	})}
 
 	repo := &orasRepositoryClient{
-		inner:      newFakeORASRepo(),
-		repository: "ghcr.io/myorg/myrepo",
-		token:      "tok-abc",
-		httpClient: client,
+		inner:        newFakeORASRepo(),
+		repository:   "ghcr.io/myorg/myrepo",
+		credentialFn: resolveCredentials("ghcr.io", Config{Token: "tok-abc"}),
+		httpClient:   client,
 	}
 
 	if err := tryDeleteGHCRTag(context.Background(), repo, "state-default", testDigest); err != nil {
@@ -696,14 +696,14 @@ func TestTryDeleteGHCRTag_PassesTokenAndClientToGitHubAPI(t *testing.T) {
 
 func TestTryDeleteGHCRTag_PropagatesGitHubAPIError(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		return fakeGitHubResponse(http.StatusUnauthorized, "denied"), nil
+		return fakeGitHubResponse(http.StatusUnauthorized, `{"message":"Bad credentials"}`), nil
 	})}
 
 	repo := &orasRepositoryClient{
-		inner:      newFakeORASRepo(),
-		repository: "ghcr.io/myorg/myrepo",
-		token:      "bad-token",
-		httpClient: client,
+		inner:        newFakeORASRepo(),
+		repository:   "ghcr.io/myorg/myrepo",
+		credentialFn: resolveCredentials("ghcr.io", Config{Token: "bad-token"}),
+		httpClient:   client,
 	}
 
 	err := tryDeleteGHCRTag(context.Background(), repo, "state-default", testDigest)
@@ -712,6 +712,183 @@ func TestTryDeleteGHCRTag_PropagatesGitHubAPIError(t *testing.T) {
 	}
 	if !isHTTPStatus(err, http.StatusUnauthorized) {
 		t.Errorf("error = %v, want httpStatusErr 401", err)
+	}
+	if !strings.Contains(err.Error(), "Bad credentials") {
+		t.Errorf("error = %v, want GitHub message included", err)
+	}
+}
+
+func TestDelete_GHCRLastTaggedVersionPublishesUnlockAnchor(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+
+	var mu sync.Mutex
+	nextID := int64(10)
+	idByDigest := make(map[string]int64)
+
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		// Build live GitHub package version view from fakeORASRepo tags.
+		tagsByDigest := make(map[string][]string)
+		fake.mu.Lock()
+		for tag, desc := range fake.tags {
+			d := desc.Digest.String()
+			tagsByDigest[d] = append(tagsByDigest[d], tag)
+			if _, ok := idByDigest[d]; !ok {
+				nextID++
+				idByDigest[d] = nextID
+			}
+		}
+		fake.mu.Unlock()
+
+		if r.Method == http.MethodGet {
+			var list []githubPackageVersion
+			for d, tags := range tagsByDigest {
+				var v githubPackageVersion
+				v.ID = idByDigest[d]
+				v.Name = d
+				v.Metadata.Container.Tags = tags
+				list = append(list, v)
+			}
+			b, _ := json.Marshal(list)
+			return fakeGitHubResponse(http.StatusOK, string(b)), nil
+		}
+
+		// DELETE .../versions/<id>: reject with HTTP 400 when only 1 tagged version exists.
+		var targetDigest string
+		for d, id := range idByDigest {
+			if strings.HasSuffix(r.URL.Path, "/"+strconv.FormatInt(id, 10)) {
+				targetDigest = d
+				break
+			}
+		}
+		if targetDigest == "" || len(tagsByDigest[targetDigest]) == 0 {
+			return fakeGitHubResponse(http.StatusNotFound, `{"message":"Not Found"}`), nil
+		}
+		if len(tagsByDigest) == 1 {
+			return fakeGitHubResponse(http.StatusBadRequest, `{"message":"You cannot delete the last tagged version of a package."}`), nil
+		}
+		fake.mu.Lock()
+		for _, tag := range tagsByDigest[targetDigest] {
+			delete(fake.tags, tag)
+		}
+		for dgst := range fake.blobs {
+			if dgst.String() == targetDigest {
+				delete(fake.blobs, dgst)
+			}
+		}
+		fake.mu.Unlock()
+		return fakeGitHubResponse(http.StatusNoContent, ""), nil
+	})}
+
+	repo := &orasRepositoryClient{
+		inner:        &deleteUnsupportedRepo{delegatingRepo{fake}},
+		repository:   "ghcr.io/myorg/myrepo",
+		credentialFn: resolveCredentials("ghcr.io", Config{Token: "tok"}),
+		httpClient:   httpClient,
+	}
+	c := newTestClient(repo)
+
+	if err := c.Put(ctx, "default", []byte("sole-workspace")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := c.Delete(ctx, "default"); err != nil {
+		t.Fatalf("Delete on single-workspace GHCR package: %v", err)
+	}
+	if got, err := c.Get(ctx, "default"); err != nil || got != nil {
+		t.Fatalf("Get after Delete = %q, %v; want nil, nil", got, err)
+	}
+	// Workspace must remain reusable (not wedged in marker-only state) and
+	// DeleteWorkspace must be idempotent even when only unlocked-* remains.
+	if err := c.Put(ctx, "default", []byte("recreated")); err != nil {
+		t.Fatalf("Put after Delete reset: %v", err)
+	}
+	if err := c.DeleteWorkspace(ctx, "default"); err != nil {
+		t.Fatalf("first DeleteWorkspace: %v", err)
+	}
+	if err := c.DeleteWorkspace(ctx, "default"); err != nil {
+		t.Fatalf("second DeleteWorkspace (only unlock anchor left): %v", err)
+	}
+}
+
+func TestDeleteWorkspace_GHCRBatchesVersionPaging(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	var getCalls int
+
+	var mu sync.Mutex
+	nextID := int64(100)
+	idByDigest := make(map[string]int64)
+
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		tagsByDigest := make(map[string][]string)
+		fake.mu.Lock()
+		for tag, desc := range fake.tags {
+			d := desc.Digest.String()
+			tagsByDigest[d] = append(tagsByDigest[d], tag)
+			if _, ok := idByDigest[d]; !ok {
+				nextID++
+				idByDigest[d] = nextID
+			}
+		}
+		fake.mu.Unlock()
+
+		if r.Method == http.MethodGet {
+			getCalls++
+			var list []githubPackageVersion
+			for d, tags := range tagsByDigest {
+				var v githubPackageVersion
+				v.ID = idByDigest[d]
+				v.Name = d
+				v.Metadata.Container.Tags = tags
+				list = append(list, v)
+			}
+			b, _ := json.Marshal(list)
+			return fakeGitHubResponse(http.StatusOK, string(b)), nil
+		}
+
+		for d, id := range idByDigest {
+			if strings.HasSuffix(r.URL.Path, "/"+strconv.FormatInt(id, 10)) {
+				fake.mu.Lock()
+				for _, tag := range tagsByDigest[d] {
+					delete(fake.tags, tag)
+				}
+				fake.mu.Unlock()
+				return fakeGitHubResponse(http.StatusNoContent, ""), nil
+			}
+		}
+		return fakeGitHubResponse(http.StatusNotFound, `{"message":"Not Found"}`), nil
+	})}
+
+	repo := &orasRepositoryClient{
+		inner:        &deleteUnsupportedRepo{delegatingRepo{fake}},
+		repository:   "ghcr.io/myorg/myrepo",
+		credentialFn: resolveCredentials("ghcr.io", Config{Token: "tok"}),
+		httpClient:   httpClient,
+	}
+	c := newTestClient(repo)
+	c.config.MaxVersions = 10
+
+	if err := c.Put(ctx, "keep", []byte("anchor")); err != nil {
+		t.Fatalf("Put(keep): %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := c.Put(ctx, "target", []byte(fmt.Sprintf("v-%d", i))); err != nil {
+			t.Fatalf("Put(target %d): %v", i, err)
+		}
+	}
+
+	if err := c.DeleteWorkspace(ctx, "target"); err != nil {
+		t.Fatalf("DeleteWorkspace(target): %v", err)
+	}
+	// 7 tags deleted (state, 5x stver, wsmeta), but package versions are listed once.
+	if getCalls != 1 {
+		t.Fatalf("GitHub GET version list calls = %d, want 1", getCalls)
 	}
 }
 

@@ -273,10 +273,7 @@ func TestResolveCredentials_CallerFuncHostGuard(t *testing.T) {
 				}
 				return Credential{Username: "user", Password: "pass"}, nil
 			}}
-			credFn, token, static := resolveCredentials(tt.registry, "team/app", cfg)
-			if token != "" || static.Username != "" || static.Password != "" || static.AccessToken != "" {
-				t.Errorf("token = %q, static = %+v, want empty for a caller resolver", token, static)
-			}
+			credFn := resolveCredentials(tt.registry, cfg)
 
 			cred, err := credFn(ctx, orasProperties.Resource{Registry: tt.challenge})
 			if err != nil {
@@ -305,7 +302,7 @@ func TestResolveCredentials_CallerFuncHostGuard(t *testing.T) {
 		cfg := Config{CredentialFunc: func(context.Context, string) (Credential, error) {
 			return Credential{}, wantErr
 		}}
-		credFn, _, _ := resolveCredentials("registry.example.com", "team/app", cfg)
+		credFn := resolveCredentials("registry.example.com", cfg)
 		cred, err := credFn(ctx, orasProperties.Resource{Registry: "registry.example.com"})
 		if !errors.Is(err, wantErr) {
 			t.Fatalf("error = %v, want %v", err, wantErr)

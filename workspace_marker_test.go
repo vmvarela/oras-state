@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"sync"
@@ -45,6 +46,21 @@ func (r *markerTestRepo) Tag(ctx context.Context, desc ocispec.Descriptor, refer
 	r.mu.Lock()
 	r.tagOrder = append(r.tagOrder, reference)
 	r.mu.Unlock()
+	return nil
+}
+
+func (r *markerTestRepo) PushReference(ctx context.Context, expected ocispec.Descriptor, content io.Reader, reference string) error {
+	if _, err := digest.Parse(reference); err != nil && reference == r.failTagRef && r.failTagErr != nil {
+		return r.failTagErr
+	}
+	if err := r.delegatingRepo.PushReference(ctx, expected, content, reference); err != nil {
+		return err
+	}
+	if _, err := digest.Parse(reference); err != nil {
+		r.mu.Lock()
+		r.tagOrder = append(r.tagOrder, reference)
+		r.mu.Unlock()
+	}
 	return nil
 }
 

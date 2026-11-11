@@ -44,6 +44,15 @@ func (r *countingOpsRepo) Tag(ctx context.Context, desc ocispec.Descriptor, refe
 	return r.delegatingRepo.Tag(ctx, desc, reference)
 }
 
+func (r *countingOpsRepo) PushReference(ctx context.Context, expected ocispec.Descriptor, content io.Reader, reference string) error {
+	if _, err := digest.Parse(reference); err != nil {
+		r.mu.Lock()
+		r.tagCalls++
+		r.mu.Unlock()
+	}
+	return r.delegatingRepo.PushReference(ctx, expected, content, reference)
+}
+
 func (r *countingOpsRepo) Delete(ctx context.Context, target ocispec.Descriptor) error {
 	r.mu.Lock()
 	r.deleteCalls++
@@ -72,6 +81,15 @@ func (r *deleteTrackingRepo) Tag(ctx context.Context, desc ocispec.Descriptor, r
 	r.tagCalls++
 	r.mu.Unlock()
 	return r.delegatingRepo.Tag(ctx, desc, reference)
+}
+
+func (r *deleteTrackingRepo) PushReference(ctx context.Context, expected ocispec.Descriptor, content io.Reader, reference string) error {
+	if _, err := digest.Parse(reference); err != nil {
+		r.mu.Lock()
+		r.tagCalls++
+		r.mu.Unlock()
+	}
+	return r.delegatingRepo.PushReference(ctx, expected, content, reference)
 }
 
 func (r *deleteTrackingRepo) Delete(ctx context.Context, target ocispec.Descriptor) error {
@@ -596,6 +614,15 @@ func (r *tagMoveTrackingRepo) Tag(ctx context.Context, desc ocispec.Descriptor, 
 	return r.delegatingRepo.Tag(ctx, desc, reference)
 }
 
+func (r *tagMoveTrackingRepo) PushReference(ctx context.Context, expected ocispec.Descriptor, content io.Reader, reference string) error {
+	if _, err := digest.Parse(reference); err != nil {
+		r.mu.Lock()
+		r.tagCalls++
+		r.mu.Unlock()
+	}
+	return r.delegatingRepo.PushReference(ctx, expected, content, reference)
+}
+
 func (r *tagMoveTrackingRepo) Delete(ctx context.Context, target ocispec.Descriptor) error {
 	r.mu.Lock()
 	r.deleted = append(r.deleted, target.Digest)
@@ -1020,7 +1047,7 @@ func TestGHCRFallback_PropagatesCancelToCredentialFunc(t *testing.T) {
 
 	credEntered := make(chan struct{})
 	var gotCancellation bool
-	credFn, _, _ := resolveCredentials("ghcr.io", "owner/repo", Config{CredentialFunc: func(ctx context.Context, hostport string) (Credential, error) {
+	credFn := resolveCredentials("ghcr.io", Config{CredentialFunc: func(ctx context.Context, hostport string) (Credential, error) {
 		close(credEntered)
 		select {
 		case <-ctx.Done():

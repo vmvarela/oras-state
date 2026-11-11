@@ -53,7 +53,8 @@ func BuildHTTPClient(skipVerify bool, caFile string) (*http.Client, error) {
 	return &http.Client{Transport: t}, nil
 }
 
-// Version is the provider version, set at build time via -ldflags (e.g. -X 'oras.Version=1.0.0').
+// Version is the library version, set at build time via -ldflags
+// (e.g. -X 'github.com/vmvarela/oras-state.Version=1.0.0').
 // Defaults to "dev" for development builds.
 var Version = "dev"
 
@@ -146,6 +147,7 @@ type Client struct {
 // required by the state backend.
 type orasRepository interface {
 	Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error
+	PushReference(ctx context.Context, expected ocispec.Descriptor, content io.Reader, reference string) error
 	Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error)
 	Exists(ctx context.Context, target ocispec.Descriptor) (bool, error)
 	Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error)
@@ -159,8 +161,6 @@ type orasRepository interface {
 type orasRepositoryClient struct {
 	repository   string // full reference: registry/repository
 	inner        orasRepository
-	token        string                     // access token (for GHCR API calls)
-	resolvedCred orasCredentials.Credential // resolved credential, whatever path produced it
 	credentialFn orasCredentials.CredentialFunc
 	httpClient   *http.Client
 }
@@ -172,27 +172,18 @@ type orasRepositoryClient struct {
 // is propagated into the caller CredentialFunc so cancellation (and any
 // per-call values) reach credential resolution; discovery policy is unchanged.
 func (r *orasRepositoryClient) accessToken(ctx context.Context) (string, error) {
-	if r.token != "" {
-		return r.token, nil
+	if r.credentialFn == nil {
+		return "", nil
 	}
-	if r.resolvedCred.AccessToken != "" {
-		return r.resolvedCred.AccessToken, nil
+	host := normalizeRegistryHost(strings.SplitN(r.repository, "/", 2)[0])
+	cred, err := r.credentialFn(ctx, orasProperties.Resource{Registry: host})
+	if err != nil {
+		return "", err
 	}
-	if r.resolvedCred.Password != "" {
-		return r.resolvedCred.Password, nil
+	if cred.AccessToken != "" {
+		return cred.AccessToken, nil
 	}
-	if r.credentialFn != nil {
-		host := normalizeRegistryHost(strings.SplitN(r.repository, "/", 2)[0])
-		cred, err := r.credentialFn(ctx, orasProperties.Resource{Registry: host})
-		if err != nil {
-			return "", err
-		}
-		if cred.AccessToken != "" {
-			return cred.AccessToken, nil
-		}
-		return cred.Password, nil
-	}
-	return "", nil
+	return cred.Password, nil
 }
 
 // NewClient creates an ORAS client for the given registry and repository.
@@ -263,7 +254,7 @@ func newORASRepositoryClient(registry, repository string, cfg Config) (*orasRepo
 	//
 	// Terraform/OpenTofu CLI config and Docker credential discovery belong to
 	// consumers and should be supplied through CredentialFunc.
-	cred, resolvedToken, resolvedCred := resolveCredentials(registry, repository, cfg)
+	cred := resolveCredentials(registry, cfg)
 
 	repo.Registry.Client = &orasAuth.Client{
 		Client:         httpClient,
@@ -274,40 +265,11 @@ func newORASRepositoryClient(registry, repository string, cfg Config) (*orasRepo
 	return &orasRepositoryClient{
 		repository:   fullRef,
 		inner:        repo,
-		token:        resolvedToken,
-		resolvedCred: resolvedCred,
 		credentialFn: cred,
 		httpClient:   httpClient,
 	}, nil
 }
 
-// resolveCredentials builds a credential function using the following priority:
-//
-// Credential Resolution Order:
-//  1. Explicit token from cfg.Token (set via Config.Token)
-//  2. Explicit username/password from cfg.Username/cfg.Password (set via Config.Username/Config.Password)
-//  3. ORAS_TOKEN environment variable (applies to any registry)
-//  4. For ghcr.io only:
-//     a. GHCR_TOKEN environment variable
-//     b. GITHUB_TOKEN environment variable
-//  5. Anonymous access (EmptyCredential)
-//
-// Steps 1-2 are reachable only by direct Client construction (tests,
-// library use): the provider never populates these Config fields, so
-// provider users start at step 3.
-//
-// Environment Variable Precedence:
-//   - ORAS_TOKEN: Universal token for any OCI registry
-//   - GHCR_TOKEN: GitHub Container Registry specific token (ghcr.io only)
-//   - GITHUB_TOKEN: GitHub API token, can be used for ghcr.io (ghcr.io only)
-//
-// Pre:  registry is a non-empty hostname string.
-// Post: returns a non-nil CredentialFunc; the returned token is non-empty only
-//
-//	when an access token was resolved (cases 1, 3, 4a, 4b above); the
-//	returned Credential is the underlying credential regardless of which
-//	path resolved it (EmptyCredential for anonymous).
-//
 // tokenCredential converts a bearer-style token into a credential the
 // registry can actually authenticate. GHCR rejects tokens sent raw as
 // Bearer — oras-go skips the exchange when AccessToken is set — and
@@ -321,7 +283,15 @@ func tokenCredential(registry, token string) orasCredentials.Credential {
 	return orasCredentials.Credential{AccessToken: token}
 }
 
-func resolveCredentials(registry, repository string, cfg Config) (orasCredentials.CredentialFunc, string, orasCredentials.Credential) {
+// resolveCredentials builds a host-scoped credential function using the
+// following priority:
+//  0. Caller-supplied cfg.CredentialFunc
+//  1. Explicit token from cfg.Token
+//  2. Explicit username/password from cfg.Username/cfg.Password
+//  3. ORAS_TOKEN environment variable (applies to any registry)
+//  4. For ghcr.io only: GHCR_TOKEN, then GITHUB_TOKEN
+//  5. Anonymous access (EmptyCredential)
+func resolveCredentials(registry string, cfg Config) orasCredentials.CredentialFunc {
 	// Normalize the host so case variants ("GHCR.IO") and Docker-style keys
 	// ("https://ghcr.io/v1/") match the GHCR-specific paths below.
 	registry = normalizeRegistryHost(registry)
@@ -345,42 +315,37 @@ func resolveCredentials(registry, repository string, cfg Config) (orasCredential
 				Password:    cred.Password,
 				AccessToken: cred.AccessToken,
 			}, nil
-		}, "", orasCredentials.EmptyCredential
+		}
 	}
 
 	// Priority 1: Explicit token
 	if cfg.Token != "" {
-		cred := tokenCredential(registry, cfg.Token)
-		return orasCredentials.StaticCredentialFunc(registry, cred), cfg.Token, cred
+		return orasCredentials.StaticCredentialFunc(registry, tokenCredential(registry, cfg.Token))
 	}
 
 	// Priority 2: Explicit username/password
 	if cfg.Username != "" || cfg.Password != "" {
 		cred := orasCredentials.Credential{Username: cfg.Username, Password: cfg.Password}
-		return orasCredentials.StaticCredentialFunc(registry, cred), "", cred
+		return orasCredentials.StaticCredentialFunc(registry, cred)
 	}
 
 	// Priority 3: Environment variable fallback
-	// Check ORAS_TOKEN (applies to any registry)
 	if t := os.Getenv("ORAS_TOKEN"); t != "" {
-		cred := tokenCredential(registry, t)
-		return orasCredentials.StaticCredentialFunc(registry, cred), t, cred
+		return orasCredentials.StaticCredentialFunc(registry, tokenCredential(registry, t))
 	}
 
 	// For ghcr.io, also check GHCR_TOKEN and GITHUB_TOKEN
 	if registry == "ghcr.io" {
 		if t := os.Getenv("GHCR_TOKEN"); t != "" {
-			cred := tokenCredential(registry, t)
-			return orasCredentials.StaticCredentialFunc(registry, cred), t, cred
+			return orasCredentials.StaticCredentialFunc(registry, tokenCredential(registry, t))
 		}
 		if t := os.Getenv("GITHUB_TOKEN"); t != "" {
-			cred := tokenCredential(registry, t)
-			return orasCredentials.StaticCredentialFunc(registry, cred), t, cred
+			return orasCredentials.StaticCredentialFunc(registry, tokenCredential(registry, t))
 		}
 	}
 
 	// Fall back to anonymous access
-	return orasCredentials.StaticCredentialFunc(registry, orasCredentials.EmptyCredential), "", orasCredentials.EmptyCredential
+	return orasCredentials.StaticCredentialFunc(registry, orasCredentials.EmptyCredential)
 }
 
 // userAgentRoundTripper wraps an http.RoundTripper to add a custom User-Agent
