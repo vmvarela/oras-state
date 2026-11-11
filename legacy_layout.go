@@ -205,20 +205,27 @@ func legacyStateVersionTagMatchesStateTag(ctx context.Context, repo *orasReposit
 		}
 		return false, err
 	}
+	return legacyStateVersionManifestMatches(m, expectedStateTag, expectedVersion), nil
+}
+
+// legacyStateVersionManifestMatches is the pure form of the legacy history
+// identity check, for callers that already hold the pinned manifest. It keeps
+// the exact rules the wrapper always applied.
+func legacyStateVersionManifestMatches(m ocispec.Manifest, expectedStateTag string, expectedVersion int) bool {
 	if m.ArtifactType != "" && m.ArtifactType != artifactTypeState {
-		return false, nil
+		return false
 	}
 	workspace := m.Annotations[annotationWorkspace]
 	if workspace == "" || stateTagPrefix+legacyWorkspaceTagFor(workspace) != expectedStateTag {
-		return false, nil
+		return false
 	}
 	if raw := m.Annotations[annotationStateVersion]; raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n != expectedVersion {
-			return false, nil
+			return false
 		}
 	}
-	return true, nil
+	return true
 }
 
 func legacyWorkspaceNameFromTag(ctx context.Context, repo *orasRepositoryClient, stateTag string) (string, error) {

@@ -137,7 +137,7 @@ func TestCopyPlanAndCopyTo_PreservesTagsAndDigests(t *testing.T) {
 		t.Fatalf("tag alias: %v", err)
 	}
 	tombstoneTag := unlockedTagPrefix + workspaceTagFor("gone")
-	addCopyArtifact(t, srcRepo, tombstoneTag, map[string]string{annotationWorkspace: "gone"})
+	addCopyUnlockMarker(t, src, srcRepo, tombstoneTag, "gone")
 
 	plan, err := src.PlanCopy(ctx)
 	if err != nil {
@@ -775,6 +775,617 @@ func TestCopyTo_DetectsDestinationTagMovementAfterCopy(t *testing.T) {
 	}
 	if got := resolveFake(t, dstInner, moveTag); got.Digest != moveDesc.Digest {
 		t.Fatalf("tag %q = %s, want the concurrent move %s to remain", moveTag, got.Digest, moveDesc.Digest)
+	}
+}
+
+// addCopyUnlockMarker publishes the exact empty marker retagToUnlocked writes
+// and points tag at it. It is used to seed unlocked-* tombstones and locked-*
+// aliases without a real registry that rejects DELETE.
+func addCopyUnlockMarker(t *testing.T, c *Client, repo *fakeORASRepo, tag, workspace string) ocispec.Descriptor {
+	t.Helper()
+	ctx := context.Background()
+	wc := newWorkspaceClient(c, workspace)
+	desc, err := wc.packLockManifest(ctx, "", 0, 0, "")
+	if err != nil {
+		t.Fatalf("pack unlock marker: %v", err)
+	}
+	if err := repo.Tag(ctx, desc, tag); err != nil {
+		t.Fatalf("tag unlock marker %q: %v", tag, err)
+	}
+	return desc
+}
+
+// addCopyLegacyHistory publishes a state-typed manifest for workspace under a
+// literal legacy history tag such as state-foo-v1.
+func addCopyLegacyHistory(t *testing.T, c *Client, repo *fakeORASRepo, tag, workspace, version string) ocispec.Descriptor {
+	t.Helper()
+	ctx := context.Background()
+	annotations := map[string]string{annotationWorkspace: workspace}
+	if version != "" {
+		annotations[annotationStateVersion] = version
+	}
+	desc, err := newWorkspaceClient(c, workspace).packStateManifestAnnotated(ctx, nil, annotations)
+	if err != nil {
+		t.Fatalf("pack legacy history %q: %v", tag, err)
+	}
+	if err := repo.Tag(ctx, desc, tag); err != nil {
+		t.Fatalf("tag legacy history %q: %v", tag, err)
+	}
+	return desc
+}
+
+// Regression: a real Lock+Unlock against a registry that rejects DELETE (GHCR
+// returns 405) leaves locked-* pointing at the unlocked marker. Planning must
+// not mistake that validated marker for a live lock, and must still skip both
+// aliases.
+func TestCopyAfterRealUnlockOnDeleteUnsupportedRegistry(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		layout WorkspaceLayout
+	}{
+		{"hashed", WorkspaceLayoutHashed},
+		{"legacy", WorkspaceLayoutLegacy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			repo := &deleteUnsupportedRepo{delegatingRepo: delegatingRepo{inner: newFakeORASRepo()}}
+			src := &Client{
+				repoClient:   &orasRepositoryClient{repository: "example/src", inner: repo},
+				config:       Config{WorkspaceLayout: tc.layout, MaxVersions: 2},
+				retentionSem: make(chan struct{}, 3),
+			}
+			if err := src.Put(ctx, "default", []byte(`{"serial":1}`)); err != nil {
+				t.Fatalf("seed Put: %v", err)
+			}
+			src.WaitForRetention()
+
+			lockID, err := src.Lock(ctx, "default", LockInfo{ID: "regression-holder"})
+			if err != nil {
+				t.Fatalf("Lock: %v", err)
+			}
+			if err := src.Unlock(ctx, "default", lockID); err != nil {
+				t.Fatalf("Unlock on a registry that rejects DELETE: %v", err)
+			}
+
+			wsTag := src.workspaceTagFor("default")
+			lockTag := lockTagPrefix + wsTag
+			unlockedTag := unlockedTagPrefix + wsTag
+			lockDesc := resolveFake(t, repo.inner, lockTag)
+			unlockedDesc := resolveFake(t, repo.inner, unlockedTag)
+			if lockDesc.Digest != unlockedDesc.Digest {
+				t.Fatalf("lock tag = %s, unlocked tag = %s; want the same marker", lockDesc.Digest, unlockedDesc.Digest)
+			}
+
+			plan, err := src.PlanCopy(ctx)
+			if err != nil {
+				t.Fatalf("PlanCopy after a real unlock on a registry that rejects DELETE: %v", err)
+			}
+			for _, tag := range []string{lockTag, unlockedTag} {
+				if !slices.Contains(plan.Skipped, tag) {
+					t.Fatalf("plan skipped = %v, want validated marker %q", plan.Skipped, tag)
+				}
+				if _, ok := plan.snapshot[tag]; !ok {
+					t.Fatalf("plan snapshot is missing skipped marker %q", tag)
+				}
+			}
+
+			dst, dstRepo := newCopyClient(t, "example/dst", tc.layout)
+			report, err := src.CopyTo(ctx, dst, plan)
+			if err != nil {
+				t.Fatalf("CopyTo after a real unlock: %v", err)
+			}
+			if len(report.Copied) != len(plan.Artifacts) {
+				t.Fatalf("copied = %v, want %v", copyArtifactTags(report.Copied), copyPlanTags(plan))
+			}
+			for _, tag := range []string{lockTag, unlockedTag} {
+				if _, err := dstRepo.Resolve(ctx, tag); !errors.Is(err, errdef.ErrNotFound) {
+					t.Errorf("marker %q was copied: %v", tag, err)
+				}
+			}
+		})
+	}
+}
+
+// Regression: the old legacy history state-foo-v1 carries workspace annotation
+// foo, not the literal tag suffix foo-v1. It must classify as history and copy
+// unchanged even when no current state exists.
+func TestCopyLegacyHistoryStateFooV1(t *testing.T) {
+	ctx := context.Background()
+	src, srcRepo := newCopyClient(t, "example/src", WorkspaceLayoutLegacy)
+	historyTag := stateTagPrefix + "foo" + stateVersionTagSeparator + "1"
+	desc := addCopyLegacyHistory(t, src, srcRepo, historyTag, "foo", "1")
+
+	plan, err := src.PlanCopy(ctx)
+	if err != nil {
+		t.Fatalf("PlanCopy for legacy history %q: %v", historyTag, err)
+	}
+	artifact := copyArtifactByTag(t, plan, historyTag)
+	if artifact.Kind != ArtifactKindHistory || artifact.Workspace != "foo" {
+		t.Fatalf("artifact = %+v, want history for workspace foo", artifact)
+	}
+	if artifact.Descriptor.Digest != desc.Digest {
+		t.Fatalf("pinned digest = %s, want %s", artifact.Descriptor.Digest, desc.Digest)
+	}
+
+	dst, dstRepo := newCopyClient(t, "example/dst", WorkspaceLayoutLegacy)
+	if _, err := src.CopyTo(ctx, dst, plan); err != nil {
+		t.Fatalf("CopyTo legacy history: %v", err)
+	}
+	if got := resolveFake(t, dstRepo, historyTag); got.Digest != desc.Digest {
+		t.Fatalf("destination digest = %s, want %s", got.Digest, desc.Digest)
+	}
+}
+
+// addCopyTypedArtifact pushes a manifest with an explicit artifact type, layer
+// list, and annotations, then tags it. Unlike addCopyArtifact it can reproduce
+// lock marker and malformed lock shapes.
+func addCopyTypedArtifact(t *testing.T, repo *fakeORASRepo, tag, artifactType string, layers []ocispec.Descriptor, annotations map[string]string) ocispec.Descriptor {
+	t.Helper()
+	ctx := context.Background()
+	config := ocispec.DescriptorEmptyJSON
+	if err := repo.Push(ctx, config, bytes.NewReader(config.Data)); err != nil {
+		t.Fatalf("push config: %v", err)
+	}
+	m := ocispec.Manifest{
+		Versioned:    specs.Versioned{SchemaVersion: 2},
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: artifactType,
+		Config:       config,
+		Layers:       layers,
+		Annotations:  annotations,
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal artifact: %v", err)
+	}
+	desc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.FromBytes(raw),
+		Size:      int64(len(raw)),
+	}
+	if err := repo.Push(ctx, desc, bytes.NewReader(raw)); err != nil {
+		t.Fatalf("push artifact: %v", err)
+	}
+	if err := repo.Tag(ctx, desc, tag); err != nil {
+		t.Fatalf("tag artifact: %v", err)
+	}
+	return desc
+}
+
+// copyMarkerAnnotations returns the exact annotation set packLockManifest
+// writes for an empty marker.
+func copyMarkerAnnotations(workspace string) map[string]string {
+	return map[string]string{
+		annotationWorkspace: workspace,
+		annotationLockID:    "",
+		annotationLockInfo:  "",
+		annotationLockGen:   `{"generation":0}`,
+	}
+}
+
+func copyMarkerLayers() []ocispec.Descriptor {
+	return []ocispec.Descriptor{ocispec.DescriptorEmptyJSON}
+}
+
+// TestCopyPlan_ValidatesUnlockMarkersByContent proves that tag names under
+// locked-*/unlocked-* are not accepted as tombstones: only the exact empty
+// marker is skipped, and malformed, active, expired, or unknown content blocks
+// the plan in both layouts.
+func TestCopyPlan_ValidatesUnlockMarkersByContent(t *testing.T) {
+	variants := []struct {
+		name         string
+		artifactType string
+		layers       []ocispec.Descriptor
+		annotations  map[string]string
+		valid        bool
+	}{
+		{name: "valid", artifactType: artifactTypeLock, layers: copyMarkerLayers(), annotations: copyMarkerAnnotations("default"), valid: true},
+		{name: "missing lock id annotation", artifactType: artifactTypeLock, layers: copyMarkerLayers(), annotations: func() map[string]string {
+			a := copyMarkerAnnotations("default")
+			delete(a, annotationLockID)
+			return a
+		}()},
+		{name: "missing lock info annotation", artifactType: artifactTypeLock, layers: copyMarkerLayers(), annotations: func() map[string]string {
+			a := copyMarkerAnnotations("default")
+			delete(a, annotationLockInfo)
+			return a
+		}()},
+		{name: "missing generation annotation", artifactType: artifactTypeLock, layers: copyMarkerLayers(), annotations: func() map[string]string {
+			a := copyMarkerAnnotations("default")
+			delete(a, annotationLockGen)
+			return a
+		}()},
+		{name: "empty generation object", artifactType: artifactTypeLock, layers: copyMarkerLayers(), annotations: func() map[string]string {
+			a := copyMarkerAnnotations("default")
+			a[annotationLockGen] = `{}`
+			return a
+		}()},
+		{name: "null generation", artifactType: artifactTypeLock, layers: copyMarkerLayers(), annotations: func() map[string]string {
+			a := copyMarkerAnnotations("default")
+			a[annotationLockGen] = `null`
+			return a
+		}()},
+		{name: "null generation field", artifactType: artifactTypeLock, layers: copyMarkerLayers(), annotations: func() map[string]string {
+			a := copyMarkerAnnotations("default")
+			a[annotationLockGen] = `{"generation":null}`
+			return a
+		}()},
+		{name: "invalid generation JSON", artifactType: artifactTypeLock, layers: copyMarkerLayers(), annotations: func() map[string]string {
+			a := copyMarkerAnnotations("default")
+			a[annotationLockGen] = `{"generation":`
+			return a
+		}()},
+		{name: "nonempty lock info", artifactType: artifactTypeLock, layers: copyMarkerLayers(), annotations: func() map[string]string {
+			a := copyMarkerAnnotations("default")
+			a[annotationLockInfo] = `{}`
+			return a
+		}()},
+		{name: "nonempty lock id", artifactType: artifactTypeLock, layers: copyMarkerLayers(), annotations: func() map[string]string {
+			a := copyMarkerAnnotations("default")
+			a[annotationLockID] = "holder"
+			return a
+		}()},
+		{name: "active lock", artifactType: artifactTypeLock, layers: copyMarkerLayers(), annotations: func() map[string]string {
+			a := copyMarkerAnnotations("default")
+			a[annotationLockID] = "holder"
+			a[annotationLockInfo] = `{"ID":"holder"}`
+			a[annotationLockGen] = `{"generation":3}`
+			return a
+		}()},
+		{name: "expired lock", artifactType: artifactTypeLock, layers: copyMarkerLayers(), annotations: func() map[string]string {
+			a := copyMarkerAnnotations("default")
+			a[annotationLockID] = "holder"
+			a[annotationLockInfo] = `{"ID":"holder"}`
+			a[annotationLockGen] = `{"generation":2,"lease_expiry":1}`
+			return a
+		}()},
+		{name: "holder in generation metadata", artifactType: artifactTypeLock, layers: copyMarkerLayers(), annotations: func() map[string]string {
+			a := copyMarkerAnnotations("default")
+			a[annotationLockGen] = `{"generation":0,"holder_id":"holder"}`
+			return a
+		}()},
+		{name: "wrong artifact type", artifactType: artifactTypeState, layers: copyMarkerLayers(), annotations: copyMarkerAnnotations("default")},
+		{name: "unexpected layer", artifactType: artifactTypeLock, layers: []ocispec.Descriptor{{
+			MediaType: mediaTypeStateLayer,
+			Digest:    digest.FromString("state"),
+			Size:      5,
+		}}, annotations: copyMarkerAnnotations("default")},
+		{name: "wrong workspace identity", artifactType: artifactTypeLock, layers: copyMarkerLayers(), annotations: copyMarkerAnnotations("other")},
+	}
+
+	layouts := []struct {
+		name   string
+		layout WorkspaceLayout
+	}{
+		{"hashed", WorkspaceLayoutHashed},
+		{"legacy", WorkspaceLayoutLegacy},
+	}
+	prefixes := []struct {
+		name   string
+		prefix string
+	}{
+		{"locked", lockTagPrefix},
+		{"unlocked", unlockedTagPrefix},
+	}
+
+	for _, layout := range layouts {
+		for _, prefix := range prefixes {
+			for _, variant := range variants {
+				t.Run(layout.name+"/"+prefix.name+"/"+variant.name, func(t *testing.T) {
+					ctx := context.Background()
+					src, repo := newCopyClient(t, "example/src", layout.layout)
+					tag := prefix.prefix + src.workspaceTagFor("default")
+					addCopyTypedArtifact(t, repo, tag, variant.artifactType, variant.layers, variant.annotations)
+
+					plan, err := src.PlanCopy(ctx)
+					if variant.valid {
+						if err != nil {
+							t.Fatalf("PlanCopy for a valid marker: %v", err)
+						}
+						if !slices.Contains(plan.Skipped, tag) {
+							t.Fatalf("plan skipped = %v, want %q", plan.Skipped, tag)
+						}
+						for _, artifact := range plan.Artifacts {
+							if artifact.Tag == tag {
+								t.Fatalf("marker %q was planned for copying", tag)
+							}
+						}
+						return
+					}
+					want := "not a valid unlocked marker"
+					if prefix.prefix == lockTagPrefix {
+						want = "live lock"
+					}
+					if err == nil || !strings.Contains(err.Error(), want) {
+						t.Fatalf("PlanCopy for %s marker content = %v, want %q", variant.name, err, want)
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestCopyPlan_LegacyHistoryIdentity covers old literal history, literal
+// workspace names ending in -vN, nested suffixes, and contradictory metadata.
+func TestCopyPlan_LegacyHistoryIdentity(t *testing.T) {
+	tests := []struct {
+		name         string
+		tag          string
+		workspace    string
+		version      string
+		artifactType string
+		wantKind     ArtifactKind
+		wantErr      string
+	}{
+		{name: "old history without version annotation", tag: "state-foo-v1", workspace: "foo", wantKind: ArtifactKindHistory},
+		{name: "old history with matching version", tag: "state-foo-v1", workspace: "foo", version: "1", wantKind: ArtifactKindHistory},
+		{name: "literal workspace foo-v1 is current", tag: "state-foo-v1", workspace: "foo-v1", wantKind: ArtifactKindState},
+		{name: "nested suffix history", tag: "state-foo-v1-v2", workspace: "foo-v1", version: "2", wantKind: ArtifactKindHistory},
+		{name: "contradictory version", tag: "state-foo-v1", workspace: "foo", version: "2", wantErr: "workspace identity mismatch"},
+		{name: "wrong artifact type", tag: "state-foo-v1", workspace: "foo", artifactType: "application/vnd.example.v1", wantErr: "workspace identity mismatch"},
+		{name: "wrong workspace", tag: "state-foo-v1", workspace: "bar", wantErr: "workspace identity mismatch"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			src, repo := newCopyClient(t, "example/src", WorkspaceLayoutLegacy)
+			if tc.artifactType != "" {
+				addCopyTypedArtifact(t, repo, tc.tag, tc.artifactType, copyMarkerLayers(), map[string]string{
+					annotationWorkspace:    tc.workspace,
+					annotationStateVersion: tc.version,
+				})
+			} else {
+				addCopyLegacyHistory(t, src, repo, tc.tag, tc.workspace, tc.version)
+			}
+
+			plan, err := src.PlanCopy(ctx)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("PlanCopy = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("PlanCopy: %v", err)
+			}
+			artifact := copyArtifactByTag(t, plan, tc.tag)
+			if artifact.Kind != tc.wantKind || artifact.Workspace != tc.workspace {
+				t.Fatalf("artifact = %+v, want kind %s workspace %q", artifact, tc.wantKind, tc.workspace)
+			}
+		})
+	}
+}
+
+// TestCopyTo_DetectsSkippedAliasChange proves a validated marker that moves
+// after planning blocks the copy before any destination write.
+func TestCopyTo_DetectsSkippedAliasChange(t *testing.T) {
+	ctx := context.Background()
+	src, srcRepo := newCopyClient(t, "example/src", WorkspaceLayoutHashed)
+	seedCopySource(t, src)
+	markerTag := unlockedTagPrefix + workspaceTagFor("gone")
+	addCopyUnlockMarker(t, src, srcRepo, markerTag, "gone")
+
+	plan, err := src.PlanCopy(ctx)
+	if err != nil {
+		t.Fatalf("PlanCopy: %v", err)
+	}
+
+	stateDesc := resolveFake(t, srcRepo, stateTagPrefix+workspaceTagFor("default"))
+	if err := srcRepo.Tag(ctx, stateDesc, markerTag); err != nil {
+		t.Fatalf("move skipped marker: %v", err)
+	}
+
+	dst, dstRepo := newCopyClient(t, "example/dst", WorkspaceLayoutHashed)
+	if _, err := src.CopyTo(ctx, dst, plan); err == nil || !strings.Contains(err.Error(), "source changed") {
+		t.Fatalf("CopyTo with a moved skipped marker = %v, want source-changed error", err)
+	}
+	if len(dstRepo.tags) != 0 {
+		t.Fatalf("destination was written before the marker change was refused: %v", dstRepo.tags)
+	}
+}
+
+// TestCopyTo_RejectsTamperedKindAndSkipped proves exported plan fields cannot
+// forge a kind or drop a skipped marker.
+func TestCopyTo_RejectsTamperedKindAndSkipped(t *testing.T) {
+	ctx := context.Background()
+	src, srcRepo := newCopyClient(t, "example/src", WorkspaceLayoutLegacy)
+	seedCopySource(t, src)
+	markerTag := unlockedTagPrefix + src.workspaceTagFor("gone")
+	addCopyUnlockMarker(t, src, srcRepo, markerTag, "gone")
+	historyTag := stateTagPrefix + "foo" + stateVersionTagSeparator + "1"
+	addCopyLegacyHistory(t, src, srcRepo, historyTag, "foo", "1")
+
+	tests := []struct {
+		name    string
+		mutate  func(*CopyPlan)
+		wantErr string
+	}{
+		{
+			name: "exported kind",
+			mutate: func(plan *CopyPlan) {
+				for i := range plan.Artifacts {
+					if plan.Artifacts[i].Tag == historyTag {
+						plan.Artifacts[i].Kind = ArtifactKindState
+					}
+				}
+			},
+			wantErr: "inconsistent kind",
+		},
+		{
+			name: "dropped skipped tag",
+			mutate: func(plan *CopyPlan) {
+				plan.Skipped = slices.DeleteFunc(plan.Skipped, func(tag string) bool { return tag == markerTag })
+			},
+			wantErr: "skipped tags do not match",
+		},
+		{
+			name: "skipped tag copied",
+			mutate: func(plan *CopyPlan) {
+				plan.Artifacts = append(plan.Artifacts, CopyArtifact{
+					Tag:        markerTag,
+					Descriptor: plan.snapshot[markerTag],
+					Kind:       ArtifactKindUnknown,
+				})
+			},
+			wantErr: "inconsistent kind",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, err := src.PlanCopy(ctx)
+			if err != nil {
+				t.Fatalf("PlanCopy: %v", err)
+			}
+			tc.mutate(plan)
+
+			dst, dstRepo := newCopyClient(t, "example/dst", WorkspaceLayoutLegacy)
+			if _, err := src.CopyTo(ctx, dst, plan); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("CopyTo with tampered plan = %v, want %q", err, tc.wantErr)
+			}
+			if len(dstRepo.tags) != 0 {
+				t.Fatalf("destination was written for a tampered plan: %v", dstRepo.tags)
+			}
+		})
+	}
+}
+
+// copyRawManifest lets tests emit raw annotation JSON (including null) and an
+// explicit config/subject, which ocispec.Manifest cannot represent.
+type copyRawManifest struct {
+	SchemaVersion int                        `json:"schemaVersion"`
+	MediaType     string                     `json:"mediaType"`
+	ArtifactType  string                     `json:"artifactType,omitempty"`
+	Config        ocispec.Descriptor         `json:"config"`
+	Layers        []ocispec.Descriptor       `json:"layers"`
+	Subject       *ocispec.Descriptor        `json:"subject,omitempty"`
+	Annotations   map[string]json.RawMessage `json:"annotations,omitempty"`
+}
+
+func addCopyRawArtifact(t *testing.T, repo *fakeORASRepo, tag string, m copyRawManifest) ocispec.Descriptor {
+	t.Helper()
+	ctx := context.Background()
+	if len(m.Config.Data) > 0 {
+		if err := repo.Push(ctx, m.Config, bytes.NewReader(m.Config.Data)); err != nil {
+			t.Fatalf("push config: %v", err)
+		}
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal raw artifact: %v", err)
+	}
+	desc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.FromBytes(raw),
+		Size:      int64(len(raw)),
+	}
+	if err := repo.Push(ctx, desc, bytes.NewReader(raw)); err != nil {
+		t.Fatalf("push raw artifact: %v", err)
+	}
+	if err := repo.Tag(ctx, desc, tag); err != nil {
+		t.Fatalf("tag raw artifact: %v", err)
+	}
+	return desc
+}
+
+func copyRawMarkerAnnotations(t *testing.T, workspace string) map[string]json.RawMessage {
+	t.Helper()
+	quoted, err := json.Marshal(workspace)
+	if err != nil {
+		t.Fatalf("marshal workspace: %v", err)
+	}
+	return map[string]json.RawMessage{
+		annotationWorkspace: quoted,
+		annotationLockID:    json.RawMessage(`""`),
+		annotationLockInfo:  json.RawMessage(`""`),
+		annotationLockGen:   json.RawMessage(`"{\"generation\":0}"`),
+	}
+}
+
+// TestCopyUnlockMarkerMatchesPackedMarker validates the predicate against the
+// exact bytes packLockManifest writes, not a synthetic approximation.
+func TestCopyUnlockMarkerMatchesPackedMarker(t *testing.T) {
+	ctx := context.Background()
+	src, repo := newCopyClient(t, "example/src", WorkspaceLayoutHashed)
+	desc, err := newWorkspaceClient(src, "default").packLockManifest(ctx, "", 0, 0, "")
+	if err != nil {
+		t.Fatalf("packLockManifest: %v", err)
+	}
+	data, err := copyManifestFromDescriptor(ctx, repo, desc)
+	if err != nil {
+		t.Fatalf("copyManifestFromDescriptor: %v", err)
+	}
+	if !src.isCopyUnlockMarker(data, workspaceTagFor("default")) {
+		t.Fatalf("packed marker was not accepted: %+v", data.Manifest)
+	}
+}
+
+// TestCopyPlan_RejectsUnlockMarkerPayloadAndNullAnnotations covers payload
+// config/subject and explicit-null lock metadata that the decoded string map
+// cannot distinguish from an empty string.
+func TestCopyPlan_RejectsUnlockMarkerPayloadAndNullAnnotations(t *testing.T) {
+	subject := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    digest.FromString("subject"),
+		Size:      5,
+	}
+	unexpectedConfig := ocispec.DescriptorEmptyJSON
+	unexpectedConfig.MediaType = mediaTypeStateLayer
+
+	tests := []struct {
+		name   string
+		mutate func(*copyRawManifest)
+	}{
+		{"unexpected config descriptor", func(m *copyRawManifest) { m.Config = unexpectedConfig }},
+		{"unexpected subject", func(m *copyRawManifest) { m.Subject = &subject }},
+		{"null lock id", func(m *copyRawManifest) { m.Annotations[annotationLockID] = json.RawMessage("null") }},
+		{"null lock info", func(m *copyRawManifest) { m.Annotations[annotationLockInfo] = json.RawMessage("null") }},
+	}
+
+	layouts := []struct {
+		name   string
+		layout WorkspaceLayout
+	}{
+		{"hashed", WorkspaceLayoutHashed},
+		{"legacy", WorkspaceLayoutLegacy},
+	}
+	prefixes := []struct {
+		name   string
+		prefix string
+	}{
+		{"locked", lockTagPrefix},
+		{"unlocked", unlockedTagPrefix},
+	}
+
+	for _, layout := range layouts {
+		for _, prefix := range prefixes {
+			for _, tc := range tests {
+				t.Run(layout.name+"/"+prefix.name+"/"+tc.name, func(t *testing.T) {
+					ctx := context.Background()
+					src, repo := newCopyClient(t, "example/src", layout.layout)
+					tag := prefix.prefix + src.workspaceTagFor("default")
+					m := copyRawManifest{
+						SchemaVersion: 2,
+						MediaType:     ocispec.MediaTypeImageManifest,
+						ArtifactType:  artifactTypeLock,
+						Config:        ocispec.DescriptorEmptyJSON,
+						Layers:        copyMarkerLayers(),
+						Annotations:   copyRawMarkerAnnotations(t, "default"),
+					}
+					tc.mutate(&m)
+					addCopyRawArtifact(t, repo, tag, m)
+
+					want := "not a valid unlocked marker"
+					if prefix.prefix == lockTagPrefix {
+						want = "live lock"
+					}
+					if _, err := src.PlanCopy(ctx); err == nil || !strings.Contains(err.Error(), want) {
+						t.Fatalf("PlanCopy for %s = %v, want %q", tc.name, err, want)
+					}
+				})
+			}
+		}
 	}
 }
 

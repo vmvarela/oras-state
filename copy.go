@@ -1,6 +1,7 @@
 package orasstate
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -71,16 +72,20 @@ type CopyPlan struct {
 	Source string
 	// Artifacts are the tags that CopyTo will copy, sorted by tag.
 	Artifacts []CopyArtifact
-	// Skipped lists unlocked-* tombstone tags that the plan does not copy.
+	// Skipped lists validated unlock marker tags (locked-* aliases and
+	// unlocked-* tombstones) that the plan does not copy.
 	Skipped []string
 
-	// layout, snapshot, and tombstones bind the exported plan to the source
-	// repository and let CopyTo detect mutation or forgery. Snapshots hold the
-	// full resolved descriptor, not just the digest, so metadata mutations are
-	// rejected too.
+	// layout, snapshot, tombstones, and kinds bind the exported plan to the
+	// source repository and let CopyTo detect mutation or forgery. Snapshots
+	// hold the full resolved descriptor, not just the digest, so metadata
+	// mutations are rejected too. kinds is the classification pinned while
+	// reading the source content, so validate does not re-derive it from the
+	// tag name alone.
 	layout     WorkspaceLayout
 	snapshot   map[string]ocispec.Descriptor
 	tombstones map[string]ocispec.Descriptor
+	kinds      map[string]copyTagKind
 }
 
 // CopyReport describes what CopyTo did. A non-nil report may be returned with
@@ -98,10 +103,10 @@ type CopyReport struct {
 }
 
 // PlanCopy inventories every tag in the source repository and pins its current
-// tag-to-descriptor mapping. It refuses to plan while a locked-* tag exists,
-// skips unlocked-* tombstones, and rejects provider tags that do not match the
-// configured WorkspaceLayout. Every other tagged artifact is copied, including
-// tags this package does not recognize.
+// tag-to-descriptor mapping. It refuses to plan while an active locked-* tag
+// exists, skips validated unlock markers, and rejects provider tags that do not
+// match the configured WorkspaceLayout. Every other tagged artifact is copied,
+// including tags this package does not recognize.
 //
 // The plan is bound to this repository and workspace layout. It is a snapshot,
 // not CAS: CopyTo checks it before and after copying.
@@ -129,6 +134,7 @@ func (c *Client) PlanCopy(ctx context.Context) (*CopyPlan, error) {
 		layout:     c.config.WorkspaceLayout,
 		snapshot:   make(map[string]ocispec.Descriptor, len(tags)),
 		tombstones: make(map[string]ocispec.Descriptor),
+		kinds:      make(map[string]copyTagKind, len(tags)),
 	}
 	for _, tag := range tags {
 		if err := (orasProperties.Reference{Tag: tag}).ValidateTag(); err != nil {
@@ -146,60 +152,77 @@ func (c *Client) PlanCopy(ctx context.Context) (*CopyPlan, error) {
 		}
 
 		kind := classifyCopyTag(tag)
-		if kind == copyKindLock {
-			// Conservative: stale locks are refused too. Retiring a lock is a
-			// separate, authorized operation, never part of a copy.
-			return nil, fmt.Errorf("source repository has a live lock tag %q; unlock or retire it before copying (copy never removes source locks)", tag)
-		}
-
 		id, reserved := workspaceIDFromTag(tag)
-		if reserved {
-			switch c.config.WorkspaceLayout {
-			case WorkspaceLayoutHashed:
-				// reservedWorkspaceTags already checked the earlier listing;
-				// re-check the tag actually being pinned so a tag that appeared
-				// between the two listings cannot slip through.
-				if len(id) != 64 {
-					return nil, fmt.Errorf("legacy workspace tag %q detected: stop all writers and migrate verified state to an empty repository; do not mix provider storage formats (see docs/guides/workspace-migration.md)", tag)
-				}
-			case WorkspaceLayoutLegacy:
-				// A 64-hex id is the hashed layout's signature. A legitimate
-				// literal legacy workspace may itself be a 64-hex name; that is
-				// only accepted when the manifest annotation names that exact
-				// workspace (checked below). Tombstones carry no workspace read
-				// here, so they fail closed.
-				if isHashedWorkspaceID(id) && kind == copyKindTombstone {
-					return nil, fmt.Errorf("source tag %q uses the hashed workspace layout but this client is configured for the legacy layout", tag)
-				}
-			}
+		if reserved && c.config.WorkspaceLayout == WorkspaceLayoutHashed && len(id) != 64 {
+			// reservedWorkspaceTags already checked the earlier listing;
+			// re-check the tag actually being pinned so a tag that appeared
+			// between the two listings cannot slip through.
+			return nil, fmt.Errorf("legacy workspace tag %q detected: stop all writers and migrate verified state to an empty repository; do not mix provider storage formats (see docs/guides/workspace-migration.md)", tag)
 		}
 
-		plan.snapshot[tag] = desc
-		if kind == copyKindTombstone {
+		if kind == copyKindLock || kind == copyKindTombstone {
+			// A tag name is not proof of content: GHCR unlocks by retagging
+			// locked-* (and unlocked-*) to the empty marker. Only a positively
+			// validated marker is skipped; anything else stays a lock.
+			manifest, err := copyManifestFromDescriptor(ctx, c.repoClient.inner, desc)
+			if err != nil {
+				return nil, fmt.Errorf("reading unlock marker for source tag %q: %w", tag, err)
+			}
+			if !c.isCopyUnlockMarker(manifest, id) {
+				if kind == copyKindLock {
+					// Conservative: stale locks are refused too. Retiring a
+					// lock is a separate, authorized operation, never part of
+					// a copy.
+					return nil, fmt.Errorf("source repository has a live lock tag %q; unlock or retire it before copying (copy never removes source locks)", tag)
+				}
+				return nil, fmt.Errorf("source tag %q is not a valid unlocked marker; refusing to copy ambiguous lock content", tag)
+			}
+			plan.snapshot[tag] = desc
+			plan.kinds[tag] = copyKindTombstone
 			plan.tombstones[tag] = desc
 			plan.Skipped = append(plan.Skipped, tag)
 			continue
 		}
 
+		plan.snapshot[tag] = desc
+		plan.kinds[tag] = kind
 		artifact := CopyArtifact{
 			Tag:        tag,
 			Descriptor: desc,
 			Kind:       artifactKind(kind),
 		}
 		if kind != copyKindUnknown {
-			artifact.Workspace, err = copyManifestWorkspace(ctx, c.repoClient.inner, desc)
+			manifest, err := copyManifestFromDescriptor(ctx, c.repoClient.inner, desc)
 			if err != nil {
 				return nil, fmt.Errorf("reading workspace metadata for source tag %q: %w", tag, err)
 			}
-		}
-		if reserved && c.config.WorkspaceLayout == WorkspaceLayoutLegacy && kind != copyKindTombstone && legacyWorkspaceTagFor(artifact.Workspace) != id {
-			if isHashedWorkspaceID(id) {
-				return nil, fmt.Errorf("source tag %q uses the hashed workspace layout but this client is configured for the legacy layout", tag)
+			artifact.Workspace = manifest.Manifest.Annotations[annotationWorkspace]
+			if reserved && c.config.WorkspaceLayout == WorkspaceLayoutLegacy {
+				// Full literal identity wins, including a workspace whose name
+				// ends in -vN (state-foo-v1 for workspace foo-v1).
+				matched := legacyWorkspaceTagFor(artifact.Workspace) == id
+				if !matched && kind == copyKindState && strings.HasPrefix(tag, stateTagPrefix) {
+					// Old history: state-foo-v1 belongs to workspace foo. It is
+					// history only when the pinned manifest proves that base
+					// identity and an optional version that matches the suffix.
+					base, version, ok := splitLegacyStateVersionTag(tag)
+					if ok && legacyStateVersionManifestMatches(manifest.Manifest, base, version) {
+						kind = copyKindHistory
+						plan.kinds[tag] = kind
+						artifact.Kind = artifactKind(kind)
+						matched = true
+					}
+				}
+				if !matched {
+					if isHashedWorkspaceID(id) {
+						return nil, fmt.Errorf("source tag %q uses the hashed workspace layout but this client is configured for the legacy layout", tag)
+					}
+					return nil, fmt.Errorf("workspace identity mismatch at source tag %q; refusing to copy invalid provider metadata", tag)
+				}
 			}
-			return nil, fmt.Errorf("workspace identity mismatch at source tag %q; refusing to copy invalid provider metadata", tag)
-		}
-		if reserved && c.config.WorkspaceLayout == WorkspaceLayoutHashed && kind != copyKindTombstone && id != workspaceTagFor(artifact.Workspace) {
-			return nil, fmt.Errorf("workspace identity mismatch at source tag %q; refusing to copy invalid provider metadata", tag)
+			if reserved && c.config.WorkspaceLayout == WorkspaceLayoutHashed && id != workspaceTagFor(artifact.Workspace) {
+				return nil, fmt.Errorf("workspace identity mismatch at source tag %q; refusing to copy invalid provider metadata", tag)
+			}
 		}
 		plan.Artifacts = append(plan.Artifacts, artifact)
 	}
@@ -377,7 +400,7 @@ func validateCopyTargets(src, dst *Client, plan *CopyPlan) error {
 
 // validate checks that the plan is internally consistent and unmodified.
 func (p *CopyPlan) validate() error {
-	if p.Source == "" || p.snapshot == nil {
+	if p.Source == "" || p.snapshot == nil || p.kinds == nil {
 		return errors.New("copy plan has no source snapshot")
 	}
 	seen := make(map[string]struct{}, len(p.snapshot))
@@ -389,7 +412,8 @@ func (p *CopyPlan) validate() error {
 		if !ok || !descriptorsEqual(pinned, artifact.Descriptor) {
 			return fmt.Errorf("copy plan is inconsistent for tag %q", artifact.Tag)
 		}
-		if artifact.Kind != artifactKind(classifyCopyTag(artifact.Tag)) {
+		kind, ok := p.kinds[artifact.Tag]
+		if !ok || kind == copyKindLock || kind == copyKindTombstone || artifact.Kind != artifactKind(kind) {
 			return fmt.Errorf("copy plan has an inconsistent kind for tag %q", artifact.Tag)
 		}
 		if _, skipped := p.tombstones[artifact.Tag]; skipped {
@@ -409,6 +433,9 @@ func (p *CopyPlan) validate() error {
 			return fmt.Errorf("copy plan skips unknown tag %q", tag)
 		}
 		if tombstone, ok := p.tombstones[tag]; !ok || !descriptorsEqual(tombstone, pinned) {
+			return fmt.Errorf("copy plan skips a non-tombstone tag %q", tag)
+		}
+		if kind, ok := p.kinds[tag]; !ok || kind != copyKindTombstone {
 			return fmt.Errorf("copy plan skips a non-tombstone tag %q", tag)
 		}
 		if _, dup := seen[tag]; dup {
@@ -592,24 +619,113 @@ func resolveCopyTag(ctx context.Context, repo orasRepository, tag string) (ocisp
 	})
 }
 
-// copyManifestWorkspace reads the workspace annotation from an already-pinned
-// manifest. It does not re-resolve a mutable tag and does not validate the
-// artifact's contents: a copy preserves whatever it finds.
-func copyManifestWorkspace(ctx context.Context, repo orasRepository, desc ocispec.Descriptor) (string, error) {
+// copyManifestData pairs the decoded manifest with its raw annotation JSON so
+// marker validation can distinguish an explicit empty string from null or an
+// absent key. Decoding into map[string]string loses that distinction: JSON null
+// unmarshals into an empty string without error.
+type copyManifestData struct {
+	Manifest       ocispec.Manifest
+	rawAnnotations map[string]json.RawMessage
+}
+
+// copyManifestFromDescriptor reads and decodes an already-pinned manifest. It
+// never re-resolves a tag, so classification follows the snapshot descriptor.
+func copyManifestFromDescriptor(ctx context.Context, repo orasRepository, desc ocispec.Descriptor) (copyManifestData, error) {
 	rc, err := repo.Fetch(ctx, desc)
 	if err != nil {
-		return "", err
+		return copyManifestData{}, err
 	}
 	defer func() { _ = rc.Close() }()
 	data, err := io.ReadAll(io.LimitReader(rc, maxManifestSize))
 	if err != nil {
-		return "", err
+		return copyManifestData{}, err
 	}
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return "", fmt.Errorf("decoding manifest %s: %w", desc.Digest, err)
+		return copyManifestData{}, fmt.Errorf("decoding manifest %s: %w", desc.Digest, err)
 	}
-	return manifest.Annotations[annotationWorkspace], nil
+	var raw struct {
+		Annotations map[string]json.RawMessage `json:"annotations"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return copyManifestData{}, fmt.Errorf("decoding manifest annotations %s: %w", desc.Digest, err)
+	}
+	return copyManifestData{Manifest: manifest, rawAnnotations: raw.Annotations}, nil
+}
+
+// isCopyUnlockMarker reports whether data is exactly the empty marker
+// packLockManifest(ctx, "", 0, 0, "") writes for the workspace whose provider
+// tag suffix is id. Only this positive shape is skipped: permissive parsers
+// accept absent, null, or empty metadata as zero values, which would turn any
+// content under locked-*/unlocked-* into a tombstone.
+func (c *Client) isCopyUnlockMarker(data copyManifestData, id string) bool {
+	m := data.Manifest
+	if m.ArtifactType != artifactTypeLock || !isEmptyJSONDescriptor(m.Config) ||
+		m.Subject != nil || !isUnlockMarkerLayers(m.Layers) {
+		return false
+	}
+	workspace, ok := m.Annotations[annotationWorkspace]
+	if !ok || workspace == "" || c.workspaceTagFor(workspace) != id {
+		return false
+	}
+	if raw, ok := data.rawAnnotations[annotationLockID]; !ok || !isExplicitEmptyJSONString(raw) {
+		return false
+	}
+	if raw, ok := data.rawAnnotations[annotationLockInfo]; !ok || !isExplicitEmptyJSONString(raw) {
+		return false
+	}
+	raw, ok := m.Annotations[annotationLockGen]
+	if !ok {
+		return false
+	}
+	return isZeroLockGeneration(raw)
+}
+
+// isExplicitEmptyJSONString accepts only the JSON string "". JSON null,
+// missing keys, and non-empty strings are rejected.
+func isExplicitEmptyJSONString(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 2 && trimmed[0] == '"' && trimmed[1] == '"'
+}
+
+// isEmptyJSONDescriptor reports whether desc names the empty JSON blob the OCI
+// packer uses for marker configs and placeholder layers. Data is optional.
+func isEmptyJSONDescriptor(desc ocispec.Descriptor) bool {
+	return desc.MediaType == ocispec.MediaTypeEmptyJSON &&
+		desc.Digest == ocispec.DescriptorEmptyJSON.Digest &&
+		desc.Size == ocispec.DescriptorEmptyJSON.Size
+}
+
+// isUnlockMarkerLayers accepts only the content-free layer shape
+// PackManifestVersion1_1 produces when packLockManifest passes no layers: the
+// single empty JSON descriptor (or, for other packer versions, no layers).
+func isUnlockMarkerLayers(layers []ocispec.Descriptor) bool {
+	if len(layers) == 0 {
+		return true
+	}
+	if len(layers) != 1 {
+		return false
+	}
+	return isEmptyJSONDescriptor(layers[0])
+}
+
+// isZeroLockGeneration accepts only the generation object packLockManifest
+// produces for an empty marker: a JSON object whose sole key is generation:0.
+// Absent, null, empty, or extra keys (holder/lease) are rejected.
+func isZeroLockGeneration(raw string) bool {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil || len(fields) != 1 {
+		return false
+	}
+	gen, ok := fields["generation"]
+	if !ok {
+		return false
+	}
+	var n *int64
+	if err := json.Unmarshal(gen, &n); err != nil || n == nil || *n != 0 {
+		return false
+	}
+	return true
 }
 
 // classifyCopyTag recognizes the package's own tag families. Anything else is
