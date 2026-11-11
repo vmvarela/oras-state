@@ -1787,12 +1787,27 @@ func (wc *workspaceClient) deleteDigestWithFallback(ctx context.Context, desc oc
 			}
 		}
 		if fallbackTag != wc.unlockedTag {
-			if anchorDesc, anchorErr := wc.ensureUnlockedMarker(ctx); anchorErr == nil && anchorDesc.Digest != desc.Digest {
-				// Publish the workspace's empty unlock tombstone first so the
-				// target tag (for example wsmeta-* when resetting or deleting
-				// the sole workspace in a package) is no longer the last tagged
-				// version, then retry the delete once.
+			// Publish the workspace's empty unlock tombstone first so the
+			// target tag (for example wsmeta-* when resetting or deleting the
+			// sole workspace in a package) is no longer the last tagged
+			// version, then retry the delete.
+			anchorDesc, anchorErr := wc.ensureUnlockedMarker(ctx)
+			if anchorErr != nil {
+				return fmt.Errorf("registry does not support manifest deletion and GHCR API fallback failed for %q: %w (unlock anchor publish failed: %v)", fallbackTag, ghErr, anchorErr)
+			}
+			if anchorDesc.Digest != desc.Digest {
 				ghErr = tryDeleteGHCRTagCached(ctx, wc.client.repoClient, fallbackTag, desc.Digest.String(), wc.ghcrCache)
+				if isGHCRDeleteBadRequest(ghErr) {
+					// The Packages backend can need a moment to observe the
+					// freshly published anchor. One bounded retry covers that
+					// propagation window without masking a real 400.
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(ghcrDeleteRetryDelay):
+					}
+					ghErr = tryDeleteGHCRTagCached(ctx, wc.client.repoClient, fallbackTag, desc.Digest.String(), wc.ghcrCache)
+				}
 			}
 		}
 	}

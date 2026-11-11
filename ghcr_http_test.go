@@ -720,11 +720,13 @@ func TestTryDeleteGHCRTag_PropagatesGitHubAPIError(t *testing.T) {
 
 func TestDelete_GHCRLastTaggedVersionPublishesUnlockAnchor(t *testing.T) {
 	ctx := context.Background()
+	setGHCRDeleteRetryDelay(t, time.Millisecond)
 	fake := newFakeORASRepo()
 
 	var mu sync.Mutex
 	nextID := int64(10)
 	idByDigest := make(map[string]int64)
+	anchorNotObserved := 0
 
 	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		mu.Lock()
@@ -766,6 +768,13 @@ func TestDelete_GHCRLastTaggedVersionPublishesUnlockAnchor(t *testing.T) {
 		}
 		if targetDigest == "" || len(tagsByDigest[targetDigest]) == 0 {
 			return fakeGitHubResponse(http.StatusNotFound, `{"message":"Not Found"}`), nil
+		}
+		if len(tagsByDigest) > 1 && anchorNotObserved == 0 {
+			// The Packages backend has not observed the freshly published
+			// anchor yet; the bounded retry in deleteDigestWithFallback must
+			// recover from this instead of failing the delete.
+			anchorNotObserved++
+			return fakeGitHubResponse(http.StatusBadRequest, `{"message":"You cannot delete the last tagged version of a package."}`), nil
 		}
 		if len(tagsByDigest) == 1 {
 			return fakeGitHubResponse(http.StatusBadRequest, `{"message":"You cannot delete the last tagged version of a package."}`), nil
@@ -810,6 +819,70 @@ func TestDelete_GHCRLastTaggedVersionPublishesUnlockAnchor(t *testing.T) {
 	}
 	if err := c.DeleteWorkspace(ctx, "default"); err != nil {
 		t.Fatalf("second DeleteWorkspace (only unlock anchor left): %v", err)
+	}
+	if anchorNotObserved != 1 {
+		t.Fatalf("anchor propagation rejection seen %d times, want 1", anchorNotObserved)
+	}
+}
+
+func TestDelete_GHCRAnchorFailureIsReported(t *testing.T) {
+	ctx := context.Background()
+	setGHCRDeleteRetryDelay(t, time.Millisecond)
+	fake := newFakeORASRepo()
+
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet {
+			fake.mu.Lock()
+			byDigest := make(map[string][]string)
+			var order []string
+			for tag, desc := range fake.tags {
+				d := desc.Digest.String()
+				if _, ok := byDigest[d]; !ok {
+					order = append(order, d)
+				}
+				byDigest[d] = append(byDigest[d], tag)
+			}
+			fake.mu.Unlock()
+			list := make([]githubPackageVersion, 0, len(order))
+			for i, d := range order {
+				var v githubPackageVersion
+				v.ID = int64(i + 1)
+				v.Name = d
+				v.Metadata.Container.Tags = byDigest[d]
+				list = append(list, v)
+			}
+			b, _ := json.Marshal(list) //nolint:errchkjson // test fixture
+			return fakeGitHubResponse(http.StatusOK, string(b)), nil
+		}
+		return fakeGitHubResponse(http.StatusBadRequest, `{"message":"You cannot delete the last tagged version of a package."}`), nil
+	})}
+
+	c := newTestClient(&orasRepositoryClient{
+		inner:        &deleteUnsupportedRepo{delegatingRepo{fake}},
+		repository:   "ghcr.io/myorg/myrepo",
+		credentialFn: resolveCredentials("ghcr.io", Config{Token: "tok"}),
+		httpClient:   httpClient,
+	})
+	if err := c.Put(ctx, "default", []byte("state")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// A live lock left on the unlock tag means the anchor cannot be published.
+	wc := newWorkspaceClient(c, "default")
+	live, err := wc.packLockManifest(ctx, "held", 1, 0, "")
+	if err != nil {
+		t.Fatalf("pack lock manifest: %v", err)
+	}
+	if err := fake.Tag(ctx, live, unlockedTagPrefix+workspaceTagFor("default")); err != nil {
+		t.Fatalf("tag foreign unlock marker: %v", err)
+	}
+
+	err = c.Delete(ctx, "default")
+	if err == nil {
+		t.Fatal("Delete succeeded; want anchor failure to be reported")
+	}
+	if !strings.Contains(err.Error(), "unlock anchor publish failed") || !strings.Contains(err.Error(), "does not hold a valid unlock marker") {
+		t.Fatalf("Delete error = %v; want anchor failure detail", err)
 	}
 }
 

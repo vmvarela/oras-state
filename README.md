@@ -170,6 +170,8 @@ The default layout hashes every logical state/workspace name using full SHA-256 
 
 On the default layout, the first `Put` publishes a small, internal `wsmeta-` workspace marker before publishing state. If marker publication fails, `Put` fails without publishing state. If initialization then fails, the marker remains; `Get` fails closed and `Put`/`Lock` refuse to treat the workspace as new. Recover the state or explicitly reset the workspace with `Delete`/`DeleteWorkspace`. The marker is prospective recovery evidence, not a transaction or lock: it does not fence concurrent writers, and it cannot identify an older workspace whose state disappeared before that workspace was marked. `Lock`, `Unlock`, and history reads do not create or require the marker.
 
+`List` derives workspace names by reading only the `state-` and `wsmeta-` tags. History (`stver-`), lock, and unlock tags are checked for valid naming but their manifests are not read, so one corrupt lock or history manifest does not fail a listing; the operations that use those tags (locking, `ListVersions`, `GetVersion`) still fail closed on their own reads.
+
 `WorkspaceLayoutLegacy` exists only for compatibility with repositories created by the historical layout. New consumers should use the default hashed layout.
 
 Do not mix old and new layouts in the same repository.
