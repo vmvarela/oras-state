@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
+	"maps"
 	"slices"
 	"strings"
 
@@ -31,19 +31,6 @@ const (
 	ArtifactKindUnknown ArtifactKind = "unknown"
 )
 
-// copyTagKind is the internal classification, including tags a copy refuses or
-// skips.
-type copyTagKind uint8
-
-const (
-	copyKindState copyTagKind = iota
-	copyKindHistory
-	copyKindMarker
-	copyKindUnknown
-	copyKindTombstone
-	copyKindLock
-)
-
 // CopyArtifact is one tagged artifact pinned by a CopyPlan.
 type CopyArtifact struct {
 	// Tag is the source tag name.
@@ -58,33 +45,50 @@ type CopyArtifact struct {
 	Workspace string
 }
 
-// CopyPlan is a snapshot of a source repository's tags, pinned to the
-// descriptor (and therefore digest) each tag resolved to when the plan was
-// made. It is created by PlanCopy and consumed by CopyTo. CopyTo rejects a plan
-// whose exported fields no longer match the unexported snapshot.
+// CopyPlan is an immutable snapshot of a source repository's tags, pinned to
+// the descriptor (and therefore digest) each tag resolved to when the plan was
+// made. It is created by PlanCopy and consumed by CopyTo.
 //
 // A plan is not CAS: the source can change between PlanCopy and CopyTo. CopyTo
 // re-inventories the source before writing and again after copying, and fails
 // if the tag-to-digest snapshot moved.
 type CopyPlan struct {
-	// Source is the full source repository reference (registry/repository).
-	Source string
-	// Artifacts are the tags that CopyTo will copy, sorted by tag.
-	Artifacts []CopyArtifact
-	// Skipped lists validated unlock marker tags (locked-* aliases and
-	// unlocked-* tombstones) that the plan does not copy.
-	Skipped []string
+	source    string
+	layout    WorkspaceLayout
+	artifacts []CopyArtifact
+	skipped   []string
+	snapshot  map[string]digest.Digest
+}
 
-	// layout, snapshot, tombstones, and kinds bind the exported plan to the
-	// source repository and let CopyTo detect mutation or forgery. Snapshots
-	// hold the full resolved descriptor, not just the digest, so metadata
-	// mutations are rejected too. kinds is the classification pinned while
-	// reading the source content, so validate does not re-derive it from the
-	// tag name alone.
-	layout     WorkspaceLayout
-	snapshot   map[string]ocispec.Descriptor
-	tombstones map[string]ocispec.Descriptor
-	kinds      map[string]copyTagKind
+// Source returns the full source repository reference (registry/repository).
+func (p *CopyPlan) Source() string {
+	if p == nil {
+		return ""
+	}
+	return p.source
+}
+
+// Artifacts returns a copy of the tags that CopyTo will copy, sorted by tag.
+func (p *CopyPlan) Artifacts() []CopyArtifact {
+	if p == nil {
+		return nil
+	}
+	out := slices.Clone(p.artifacts)
+	for i := range out {
+		out[i].Descriptor.URLs = slices.Clone(out[i].Descriptor.URLs)
+		out[i].Descriptor.Data = slices.Clone(out[i].Descriptor.Data)
+		out[i].Descriptor.Annotations = maps.Clone(out[i].Descriptor.Annotations)
+	}
+	return out
+}
+
+// Skipped returns a copy of the validated unlock marker tags (locked-* aliases
+// and unlocked-* tombstones) that the plan does not copy.
+func (p *CopyPlan) Skipped() []string {
+	if p == nil {
+		return nil
+	}
+	return slices.Clone(p.skipped)
 }
 
 // CopyReport describes what CopyTo did. A non-nil report may be returned with
@@ -119,25 +123,21 @@ func (c *Client) PlanCopy(ctx context.Context) (*CopyPlan, error) {
 	if err != nil {
 		return nil, err
 	}
-	if c.config.WorkspaceLayout == WorkspaceLayoutHashed {
-		// Same repository-wide check the state engine performs: the hashed
-		// layout must not contain legacy literal workspace tags.
-		if _, err := reservedWorkspaceTags(ctx, c.repoClient); err != nil {
-			return nil, err
-		}
-	}
 
 	plan := &CopyPlan{
-		Source:     c.repoClient.repository,
-		layout:     c.config.WorkspaceLayout,
-		snapshot:   make(map[string]ocispec.Descriptor, len(tags)),
-		tombstones: make(map[string]ocispec.Descriptor),
-		kinds:      make(map[string]copyTagKind, len(tags)),
+		source:   c.repoClient.repository,
+		layout:   c.config.WorkspaceLayout,
+		snapshot: make(map[string]digest.Digest, len(tags)),
 	}
 	for _, tag := range tags {
 		if err := (orasProperties.Reference{Tag: tag}).ValidateTag(); err != nil {
 			return nil, fmt.Errorf("invalid source tag %q: %w", tag, err)
 		}
+		id, reserved := workspaceIDFromTag(tag)
+		if reserved && c.config.WorkspaceLayout == WorkspaceLayoutHashed && len(id) != 64 {
+			return nil, fmt.Errorf("legacy workspace tag %q detected: stop all writers and migrate verified state to an empty repository; do not mix provider storage formats", tag)
+		}
+
 		desc, err := resolveCopyTag(ctx, c.repoClient.inner, tag)
 		if isNotFound(err) {
 			// The tag was listed but is no longer resolvable: the inventory
@@ -149,16 +149,7 @@ func (c *Client) PlanCopy(ctx context.Context) (*CopyPlan, error) {
 			return nil, fmt.Errorf("resolving source tag %q: %w", tag, err)
 		}
 
-		kind := classifyCopyTag(tag)
-		id, reserved := workspaceIDFromTag(tag)
-		if reserved && c.config.WorkspaceLayout == WorkspaceLayoutHashed && len(id) != 64 {
-			// reservedWorkspaceTags already checked the earlier listing;
-			// re-check the tag actually being pinned so a tag that appeared
-			// between the two listings cannot slip through.
-			return nil, fmt.Errorf("legacy workspace tag %q detected: stop all writers and migrate verified state to an empty repository; do not mix provider storage formats (see docs/guides/workspace-migration.md)", tag)
-		}
-
-		if kind == copyKindLock || kind == copyKindTombstone {
+		if strings.HasPrefix(tag, lockTagPrefix) || strings.HasPrefix(tag, unlockedTagPrefix) {
 			// A tag name is not proof of content: GHCR unlocks by retagging
 			// locked-* (and unlocked-*) to the empty marker. Only a positively
 			// validated marker is skipped; anything else stays a lock.
@@ -167,7 +158,7 @@ func (c *Client) PlanCopy(ctx context.Context) (*CopyPlan, error) {
 				return nil, fmt.Errorf("reading unlock marker for source tag %q: %w", tag, err)
 			}
 			if !c.isCopyUnlockMarker(manifest, id) {
-				if kind == copyKindLock {
+				if strings.HasPrefix(tag, lockTagPrefix) {
 					// Conservative: stale locks are refused too. Retiring a
 					// lock is a separate, authorized operation, never part of
 					// a copy.
@@ -175,21 +166,18 @@ func (c *Client) PlanCopy(ctx context.Context) (*CopyPlan, error) {
 				}
 				return nil, fmt.Errorf("source tag %q is not a valid unlocked marker; refusing to copy ambiguous lock content", tag)
 			}
-			plan.snapshot[tag] = desc
-			plan.kinds[tag] = copyKindTombstone
-			plan.tombstones[tag] = desc
-			plan.Skipped = append(plan.Skipped, tag)
+			plan.snapshot[tag] = desc.Digest
+			plan.skipped = append(plan.skipped, tag)
 			continue
 		}
 
-		plan.snapshot[tag] = desc
-		plan.kinds[tag] = kind
+		kind := classifyArtifactKind(tag)
 		artifact := CopyArtifact{
 			Tag:        tag,
 			Descriptor: desc,
-			Kind:       artifactKind(kind),
+			Kind:       kind,
 		}
-		if kind != copyKindUnknown {
+		if kind != ArtifactKindUnknown {
 			manifest, err := copyManifestFromDescriptor(ctx, c.repoClient.inner, desc)
 			if err != nil {
 				return nil, fmt.Errorf("reading workspace metadata for source tag %q: %w", tag, err)
@@ -199,15 +187,13 @@ func (c *Client) PlanCopy(ctx context.Context) (*CopyPlan, error) {
 				// Full literal identity wins, including a workspace whose name
 				// ends in -vN (state-foo-v1 for workspace foo-v1).
 				matched := legacyWorkspaceTagFor(artifact.Workspace) == id
-				if !matched && kind == copyKindState && strings.HasPrefix(tag, stateTagPrefix) {
+				if !matched && kind == ArtifactKindState && strings.HasPrefix(tag, stateTagPrefix) {
 					// Old history: state-foo-v1 belongs to workspace foo. It is
 					// history only when the pinned manifest proves that base
 					// identity and an optional version that matches the suffix.
 					base, version, ok := splitLegacyStateVersionTag(tag)
 					if ok && legacyStateVersionManifestMatches(manifest.Manifest, base, version) {
-						kind = copyKindHistory
-						plan.kinds[tag] = kind
-						artifact.Kind = artifactKind(kind)
+						artifact.Kind = ArtifactKindHistory
 						matched = true
 					}
 				}
@@ -222,12 +208,9 @@ func (c *Client) PlanCopy(ctx context.Context) (*CopyPlan, error) {
 				return nil, fmt.Errorf("workspace identity mismatch at source tag %q; refusing to copy invalid provider metadata", tag)
 			}
 		}
-		plan.Artifacts = append(plan.Artifacts, artifact)
+		plan.snapshot[tag] = desc.Digest
+		plan.artifacts = append(plan.artifacts, artifact)
 	}
-	slices.SortFunc(plan.Artifacts, func(a, b CopyArtifact) int {
-		return strings.Compare(a.Tag, b.Tag)
-	})
-	slices.Sort(plan.Skipped)
 	return plan, nil
 }
 
@@ -238,10 +221,10 @@ func (c *Client) PlanCopy(ctx context.Context) (*CopyPlan, error) {
 // Before writing anything it requires every destination tag to be absent or to
 // be a planned tag with exactly the planned digest and a present graph; any
 // other tag or digest is refused. Tags already present with the planned digest
-// are a resume, not an overwrite. After writing it verifies every destination
-// tag resolves to the pinned digest and its graph is present, re-inventories
-// the destination to require exactly the planned tag set, and re-inventories
-// the source, failing if the source changed.
+// are a resume, not an overwrite. After writing it re-inventories the
+// destination to require the exact planned tag-to-digest set, verifies every
+// planned graph is present, and re-inventories the source, failing if the
+// source changed.
 //
 // This is not CAS. A writer can still move a destination tag between the
 // pre-write re-resolve and Tag, or after the final inventory; the checks narrow
@@ -274,8 +257,8 @@ func (c *Client) CopyTo(ctx context.Context, dst *Client, plan *CopyPlan) (*Copy
 	if err != nil {
 		return nil, fmt.Errorf("inspecting copy destination: %w", err)
 	}
-	expectedArtifacts := make(map[string]CopyArtifact, len(plan.Artifacts))
-	for _, artifact := range plan.Artifacts {
+	expectedArtifacts := make(map[string]CopyArtifact, len(plan.artifacts))
+	for _, artifact := range plan.artifacts {
 		expectedArtifacts[artifact.Tag] = artifact
 	}
 	for tag, desc := range dstTags {
@@ -296,7 +279,7 @@ func (c *Client) CopyTo(ctx context.Context, dst *Client, plan *CopyPlan) (*Copy
 	}
 
 	report := &CopyReport{}
-	for _, artifact := range plan.Artifacts {
+	for _, artifact := range plan.artifacts {
 		if _, ok := dstTags[artifact.Tag]; ok {
 			report.Existing = append(report.Existing, artifact)
 			continue
@@ -325,32 +308,22 @@ func (c *Client) CopyTo(ctx context.Context, dst *Client, plan *CopyPlan) (*Copy
 		report.Copied = append(report.Copied, artifact)
 	}
 
-	verified := make([]CopyArtifact, 0, len(plan.Artifacts))
-	for _, artifact := range plan.Artifacts {
-		desc, err := resolveCopyTag(ctx, dst.repoClient.inner, artifact.Tag)
-		if err != nil {
-			return report, fmt.Errorf("verifying destination tag %q: %w", artifact.Tag, err)
-		}
-		if desc.Digest != artifact.Descriptor.Digest {
-			return report, fmt.Errorf("destination tag %q resolves to %s after copy, expected %s", artifact.Tag, desc.Digest, artifact.Descriptor.Digest)
-		}
-		if err := verifyCopyGraph(ctx, dst.repoClient.inner, artifact.Descriptor); err != nil {
-			return report, fmt.Errorf("verifying destination graph for tag %q: %w", artifact.Tag, err)
-		}
-		verified = append(verified, artifact)
-	}
-
 	// Final destination inventory: require the destination tag set to be
-	// exactly the planned set with the planned digests. This catches a tag that
-	// appeared or moved after the initial preflight. Skipped tombstones are not
-	// expected in the destination, so their presence is refused. This is still
-	// not CAS: a change after this inventory is undetected.
+	// exactly the planned set with the planned digests, then walk every planned
+	// graph. Skipped tombstones are not expected in the destination, so their
+	// presence is refused. This is still not CAS: a change after this inventory
+	// is undetected.
 	finalDst, err := dst.inventoryCopyTags(ctx, false)
 	if err != nil {
 		return report, fmt.Errorf("re-inspecting copy destination: %w", err)
 	}
 	if err := compareCopyDestination(plan.expectedDigests(), finalDst); err != nil {
 		return report, err
+	}
+	for _, artifact := range plan.artifacts {
+		if err := verifyCopyGraph(ctx, dst.repoClient.inner, artifact.Descriptor); err != nil {
+			return report, fmt.Errorf("verifying destination graph for tag %q: %w", artifact.Tag, err)
+		}
 	}
 
 	final, err := c.inventoryCopyTags(ctx, false)
@@ -362,12 +335,12 @@ func (c *Client) CopyTo(ctx context.Context, dst *Client, plan *CopyPlan) (*Copy
 	}
 	// Verified is only claimed once every per-tag graph check and both final
 	// inventories have passed.
-	report.Verified = verified
+	report.Verified = plan.Artifacts()
 	return report, nil
 }
 
 // validateCopyTargets rejects same-repository, layout-mismatched, and
-// inconsistent plans before any registry read or write.
+// uninitialized plans before any registry read or write.
 func validateCopyTargets(src, dst *Client, plan *CopyPlan) error {
 	if src == nil || src.repoClient == nil || src.repoClient.inner == nil {
 		return errors.New("copy source client is not configured")
@@ -381,7 +354,10 @@ func validateCopyTargets(src, dst *Client, plan *CopyPlan) error {
 	if plan == nil {
 		return errors.New("copy plan is nil")
 	}
-	if plan.Source != src.repoClient.repository {
+	if plan.source == "" || plan.snapshot == nil {
+		return errors.New("copy plan has no source snapshot")
+	}
+	if plan.source != src.repoClient.repository {
 		return errors.New("copy plan belongs to a different source repository")
 	}
 	if plan.layout != src.config.WorkspaceLayout {
@@ -390,63 +366,12 @@ func validateCopyTargets(src, dst *Client, plan *CopyPlan) error {
 	if dst.config.WorkspaceLayout != src.config.WorkspaceLayout {
 		return errors.New("copy source and destination use different workspace layouts")
 	}
-	return plan.validate()
-}
-
-// validate checks that the plan is internally consistent and unmodified.
-func (p *CopyPlan) validate() error {
-	if p.Source == "" || p.snapshot == nil || p.kinds == nil {
-		return errors.New("copy plan has no source snapshot")
-	}
-	seen := make(map[string]struct{}, len(p.snapshot))
-	for _, artifact := range p.Artifacts {
-		if artifact.Tag == "" || artifact.Descriptor.Digest == "" {
-			return errors.New("copy plan contains an empty tag or digest")
-		}
-		pinned, ok := p.snapshot[artifact.Tag]
-		if !ok || !descriptorsEqual(pinned, artifact.Descriptor) {
-			return fmt.Errorf("copy plan is inconsistent for tag %q", artifact.Tag)
-		}
-		kind, ok := p.kinds[artifact.Tag]
-		if !ok || kind == copyKindLock || kind == copyKindTombstone || artifact.Kind != artifactKind(kind) {
-			return fmt.Errorf("copy plan has an inconsistent kind for tag %q", artifact.Tag)
-		}
-		if _, skipped := p.tombstones[artifact.Tag]; skipped {
-			return fmt.Errorf("copy plan would copy skipped tombstone %q", artifact.Tag)
-		}
-		if _, dup := seen[artifact.Tag]; dup {
-			return fmt.Errorf("copy plan contains duplicate tag %q", artifact.Tag)
-		}
-		seen[artifact.Tag] = struct{}{}
-	}
-	if len(p.Skipped) != len(p.tombstones) {
-		return errors.New("copy plan skipped tags do not match the source snapshot")
-	}
-	for _, tag := range p.Skipped {
-		pinned, ok := p.snapshot[tag]
-		if !ok {
-			return fmt.Errorf("copy plan skips unknown tag %q", tag)
-		}
-		if tombstone, ok := p.tombstones[tag]; !ok || !descriptorsEqual(tombstone, pinned) {
-			return fmt.Errorf("copy plan skips a non-tombstone tag %q", tag)
-		}
-		if kind, ok := p.kinds[tag]; !ok || kind != copyKindTombstone {
-			return fmt.Errorf("copy plan skips a non-tombstone tag %q", tag)
-		}
-		if _, dup := seen[tag]; dup {
-			return fmt.Errorf("copy plan contains duplicate tag %q", tag)
-		}
-		seen[tag] = struct{}{}
-	}
-	if len(seen) != len(p.snapshot) {
-		return errors.New("copy plan does not account for every source tag")
-	}
 	return nil
 }
 
 func (p *CopyPlan) expectedDigests() map[string]digest.Digest {
-	expected := make(map[string]digest.Digest, len(p.Artifacts))
-	for _, artifact := range p.Artifacts {
+	expected := make(map[string]digest.Digest, len(p.artifacts))
+	for _, artifact := range p.artifacts {
 		expected[artifact.Tag] = artifact.Descriptor.Digest
 	}
 	return expected
@@ -457,14 +382,7 @@ func (p *CopyPlan) expectedDigests() map[string]digest.Digest {
 // destination may not exist yet, but a missing source must not silently plan a
 // zero-artifact copy. Permission and transport errors are propagated.
 func (c *Client) listCopyTags(ctx context.Context, allowMissing bool) ([]string, error) {
-	var tags []string
-	err := retry(ctx, func(ctx context.Context) error {
-		tags = nil
-		return c.repoClient.inner.Tags(ctx, "", func(page []string) error {
-			tags = append(tags, page...)
-			return nil
-		})
-	})
+	tags, err := listRepoTags(ctx, c.repoClient.inner)
 	if isNotFound(err) {
 		if allowMissing {
 			return nil, nil
@@ -506,27 +424,17 @@ func (c *Client) inventoryCopyTags(ctx context.Context, allowMissing bool) (map[
 // any way, including tombstones and tags the copy does not write. It compares
 // digests: the manifest bytes are content-addressed, while descriptor metadata
 // reported by a registry may legitimately vary between reads.
-func compareCopySnapshot(want, got map[string]ocispec.Descriptor) error {
-	wantTags := make([]string, 0, len(want))
-	for tag := range want {
-		wantTags = append(wantTags, tag)
-	}
-	slices.Sort(wantTags)
-	for _, tag := range wantTags {
+func compareCopySnapshot(want map[string]digest.Digest, got map[string]ocispec.Descriptor) error {
+	for _, tag := range slices.Sorted(maps.Keys(want)) {
 		desc, ok := got[tag]
 		if !ok {
 			return fmt.Errorf("source changed since copy plan: tag %q disappeared", tag)
 		}
-		if desc.Digest != want[tag].Digest {
-			return fmt.Errorf("source changed since copy plan: tag %q moved from %s to %s", tag, want[tag].Digest, desc.Digest)
+		if desc.Digest != want[tag] {
+			return fmt.Errorf("source changed since copy plan: tag %q moved from %s to %s", tag, want[tag], desc.Digest)
 		}
 	}
-	gotTags := make([]string, 0, len(got))
-	for tag := range got {
-		gotTags = append(gotTags, tag)
-	}
-	slices.Sort(gotTags)
-	for _, tag := range gotTags {
+	for _, tag := range slices.Sorted(maps.Keys(got)) {
 		if _, ok := want[tag]; !ok {
 			return fmt.Errorf("source changed since copy plan: tag %q appeared", tag)
 		}
@@ -538,12 +446,7 @@ func compareCopySnapshot(want, got map[string]ocispec.Descriptor) error {
 // planned set with the planned digests. Skipped tombstones are not part of the
 // expected set, so their presence is an error.
 func compareCopyDestination(want map[string]digest.Digest, got map[string]ocispec.Descriptor) error {
-	gotTags := make([]string, 0, len(got))
-	for tag := range got {
-		gotTags = append(gotTags, tag)
-	}
-	slices.Sort(gotTags)
-	for _, tag := range gotTags {
+	for _, tag := range slices.Sorted(maps.Keys(got)) {
 		expected, ok := want[tag]
 		if !ok {
 			return fmt.Errorf("destination contains unexpected tag %q after copy", tag)
@@ -552,31 +455,18 @@ func compareCopyDestination(want map[string]digest.Digest, got map[string]ocispe
 			return fmt.Errorf("destination tag %q moved to %s after copy, expected %s", tag, got[tag].Digest, expected)
 		}
 	}
-	wantTags := make([]string, 0, len(want))
-	for tag := range want {
-		wantTags = append(wantTags, tag)
-	}
-	slices.Sort(wantTags)
-	for _, tag := range wantTags {
-		desc, ok := got[tag]
-		if !ok {
+	for _, tag := range slices.Sorted(maps.Keys(want)) {
+		if _, ok := got[tag]; !ok {
 			return fmt.Errorf("destination tag %q disappeared after copy", tag)
-		}
-		if desc.Digest != want[tag] {
-			return fmt.Errorf("destination tag %q moved to %s after copy, expected %s", tag, desc.Digest, want[tag])
 		}
 	}
 	return nil
 }
 
-func descriptorsEqual(a, b ocispec.Descriptor) bool {
-	return reflect.DeepEqual(a, b)
-}
-
 // verifyCopyGraph walks the graph rooted at root and requires every referenced
-// manifest and blob to exist in repo. It parses manifests (through
-// content.Successors) but does not re-hash blob bytes: the registry CAS is
-// trusted for content integrity, as elsewhere in this package.
+// manifest and blob to exist in repo. Manifests are verified and parsed through
+// content.Successors; layer blobs are checked via Exists without downloading
+// every historical state payload.
 func verifyCopyGraph(ctx context.Context, repo orasRepository, root ocispec.Descriptor) error {
 	seen := make(map[digest.Digest]struct{})
 	var walk func(ocispec.Descriptor) error
@@ -721,29 +611,23 @@ func isZeroLockGeneration(raw string) bool {
 	return true
 }
 
-// classifyCopyTag recognizes the package's own tag families. Anything else is
-// preserved as an unknown artifact rather than dropped.
-func classifyCopyTag(tag string) copyTagKind {
-	switch {
-	case strings.HasPrefix(tag, lockTagPrefix):
-		return copyKindLock
-	case strings.HasPrefix(tag, unlockedTagPrefix):
-		return copyKindTombstone
-	}
+// classifyArtifactKind recognizes the package's own copied tag families.
+// Anything else is preserved as an unknown artifact rather than dropped.
+func classifyArtifactKind(tag string) ArtifactKind {
 	if _, reserved := workspaceIDFromTag(tag); !reserved {
-		return copyKindUnknown
+		return ArtifactKindUnknown
 	}
 	switch {
 	case strings.HasPrefix(tag, markerTagPrefix):
-		return copyKindMarker
+		return ArtifactKindMarker
 	case strings.HasPrefix(tag, stateTagPrefix):
-		return copyKindState
+		return ArtifactKindState
 	case strings.HasPrefix(tag, stateVersionTagPrefix):
 		if _, _, ok := splitStateVersionTag(tag); ok {
-			return copyKindHistory
+			return ArtifactKindHistory
 		}
 	}
-	return copyKindUnknown
+	return ArtifactKindUnknown
 }
 
 // isHashedWorkspaceID reports whether id has the exact shape produced by the
@@ -759,17 +643,4 @@ func isHashedWorkspaceID(id string) bool {
 		}
 	}
 	return true
-}
-
-func artifactKind(kind copyTagKind) ArtifactKind {
-	switch kind {
-	case copyKindState:
-		return ArtifactKindState
-	case copyKindHistory:
-		return ArtifactKindHistory
-	case copyKindMarker:
-		return ArtifactKindMarker
-	default:
-		return ArtifactKindUnknown
-	}
 }

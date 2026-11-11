@@ -300,7 +300,10 @@ func TestWorkspaceUnverifiedVersionsNotTrusted(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		huge, err := wc.packStateManifest(ctx, fm.Layers, math.MaxInt)
+		huge, err := wc.packStateManifestAnnotated(ctx, fm.Layers, map[string]string{
+			annotationWorkspace:    "default",
+			annotationStateVersion: fmt.Sprintf("%d", math.MaxInt),
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -564,4 +567,63 @@ func TestWorkspaceMigrationPreservesSource(t *testing.T) {
 	source := newTestClient(&orasRepositoryClient{inner: newFakeORASRepo()})
 	destination := newTestClient(&orasRepositoryClient{inner: newFakeORASRepo()})
 	exerciseWorkspaceMigration(t, source, destination)
+}
+
+func TestWorkspaceListSkipsHistoryAndLockFetches(t *testing.T) {
+	ctx := context.Background()
+	repo := &countingRepo{delegatingRepo: delegatingRepo{inner: newFakeORASRepo()}}
+	c := newTestClient(&orasRepositoryClient{inner: repo})
+	c.config.MaxVersions = 6
+
+	for i := 0; i < 3; i++ {
+		ws := fmt.Sprintf("ws-%d", i)
+		for v := 0; v < 6; v++ {
+			if err := c.Put(ctx, ws, []byte(ws)); err != nil {
+				t.Fatal(err)
+			}
+			c.Close()
+		}
+		if _, err := c.Lock(ctx, ws, LockInfo{ID: ws}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	repo.tags.Store(0)
+	repo.resolve.Store(0)
+	repo.fetch.Store(0)
+	got, err := c.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("List = %v, want 3 workspaces", got)
+	}
+	// 3 workspaces * (state + wsmeta) = 6 tags; none of the 18 history or 3 lock tags are fetched.
+	if tags, resolve, fetch := repo.tags.Load(), repo.resolve.Load(), repo.fetch.Load(); tags != 1 || resolve != 6 || fetch != 6 {
+		t.Fatalf("List calls: Tags=%d Resolve=%d Fetch=%d; want 1, 6, 6", tags, resolve, fetch)
+	}
+}
+
+func TestWorkspaceListFailsClosedOnMissingStateManifestBlob(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeORASRepo()
+	c := newTestClient(&orasRepositoryClient{inner: fake})
+	wc := newWorkspaceClient(c, "broken")
+
+	desc, err := wc.packStateManifestAnnotated(ctx, []ocispec.Descriptor{ocispec.DescriptorEmptyJSON}, map[string]string{
+		annotationWorkspace: "broken",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.Tag(ctx, desc, wc.stateTag); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	delete(fake.blobs, desc.Digest)
+	fake.mu.Unlock()
+
+	if _, err := c.List(ctx); !isMissingContent(err) {
+		t.Fatalf("List with missing state manifest blob = %v, want missingContentError", err)
+	}
 }

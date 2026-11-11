@@ -10,11 +10,10 @@ Compatibility testing lives in this repository because it belongs to the shared 
 |---|---|---|---|---|---|---|
 | Zot | ✅ CI + local | ✅ CI + local | ✅ CI + local | ✅ CI + local | ✅ CI + local | ✅ 2 MiB local |
 | GHCR (`ghcr.io`) | ✅ opt-in CI | ✅ opt-in CI | ✅ opt-in CI | ⚠️ skipped by design | ✅ opt-in CI | not tested |
-| Harbor | ✅ opt-in | ✅ opt-in | ✅ opt-in | ✅ opt-in | ✅ opt-in | not tested |
+| Harbor | ✅ CI | ✅ CI | ✅ CI | ✅ CI | ✅ CI | not tested |
 
-- **CI** = exercised automatically by the `zot-integration` job in [`.github/workflows/test.yml`](../.github/workflows/test.yml). GHCR is opt-in: manually run the workflow on the default branch and enable `run_ghcr`; the job writes to `ghcr.io/vmvarela/oras-state`.
+- **CI** = exercised automatically by the `zot-integration` and `harbor-integration` jobs in [`.github/workflows/test.yml`](../.github/workflows/test.yml). The Harbor job boots a throwaway local v2.15.4 instance over plain HTTP, so it needs no secrets or external service. GHCR is opt-in: manually run the workflow on the default branch and enable `run_ghcr`; the job writes to `ghcr.io/vmvarela/oras-state`.
 - **opt-in CI** = exercised only when explicitly enabled in a manual workflow run.
-- **opt-in** = exercised manually with the Harbor suite (see [Running the suites](#running-the-suites)); evaluation results are recorded in this document.
 - **⚠️ GHCR retention** = the engine skips automatic pruning on `ghcr.io`, so `MaxVersions` does not bound history there; the GHCR suite asserts this documented behavior.
 
 Workspace/state identity mapping is exercised live on Zot (`TestZotWorkspaceIsolation`, including legacy-layout migration). GHCR and Harbor suites use unique per-run workspaces.
@@ -39,7 +38,7 @@ The mandatory CI target. Tests run PlainHTTP without authentication, using eithe
 - Server-side retention rules are independent of the client and can delete artifacts the engine still references. Leave them disabled for state projects and rely on the engine's `MaxVersions`.
 - Deleting artifacts does not free storage until Harbor's garbage collection runs.
 - `/v2/_catalog` requires an administrator account; use project robot accounts (basic auth) for automation — push permission implies pull.
-- Evaluated 2026-10-18 against a local Harbor v2.15.4 over HTTP (admin account): state round-trip including delete, lock/unlock, and compressed history with client-side retention all pass (`TestHarborIntegration_*`).
+- Evaluated 2026-10-18 against a local Harbor v2.15.4 over HTTP (admin account): state round-trip including delete, lock/unlock, and compressed history with client-side retention all pass (`TestHarborIntegration_*`). Since then the same suite runs on every CI run against a throwaway local instance.
 
 ## Mutable tags and concurrency
 
@@ -82,4 +81,4 @@ TF_ORAS_HARBOR_TEST=1 \
 - No live TLS/custom-CA suite (unit coverage only).
 - Large state is validated live on Zot (2 MiB); GHCR and Harbor are not exercised with large states.
 - Repository copy (`PlanCopy`/`CopyTo`) is exercised on Zot only; GHCR and Harbor copies are untested.
-- Harbor validation is manual/opt-in, not part of CI.
+- The Harbor job boots a single-node instance with its default settings, so multi-node deployments, robot accounts with scoped permissions, and project immutability policies are not covered.

@@ -137,3 +137,67 @@ func TestClient_GetVersionRejectsInvalidVersion(t *testing.T) {
 		}
 	}
 }
+
+func TestClient_PutContinuesVersionNumberingAfterDelete(t *testing.T) {
+	ctx := context.Background()
+	repo := &orasRepositoryClient{inner: newFakeORASRepo()}
+	client := newTestClient(repo)
+	client.config.MaxVersions = 2
+
+	for _, s := range []string{"s1", "s2", "s3"} {
+		if err := client.Put(ctx, "default", []byte(s)); err != nil {
+			t.Fatalf("Put(%s): %v", s, err)
+		}
+		client.Close()
+	}
+
+	if err := client.Delete(ctx, "default"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := client.Put(ctx, "default", []byte("s4")); err != nil {
+		t.Fatalf("Put(s4): %v", err)
+	}
+	client.Close()
+
+	versions, err := client.ListVersions(ctx, "default")
+	if err != nil {
+		t.Fatalf("ListVersions: %v", err)
+	}
+	if len(versions) != 2 || versions[0].Version != 3 || versions[1].Version != 4 {
+		t.Fatalf("ListVersions after Delete+Put = %#v, want [3, 4]", versions)
+	}
+	got4, err := client.GetVersion(ctx, "default", 4)
+	if err != nil || string(got4) != "s4" {
+		t.Fatalf("GetVersion(4) = %q, %v; want %q", got4, err, "s4")
+	}
+}
+
+func TestClient_ListVersionsSingleTagListAndSingleFetchPerVersion(t *testing.T) {
+	ctx := context.Background()
+	repo := &countingRepo{delegatingRepo: delegatingRepo{inner: newFakeORASRepo()}}
+	client := newTestClient(&orasRepositoryClient{inner: repo})
+	client.config.MaxVersions = 5
+
+	for _, s := range []string{"v1", "v2", "v3"} {
+		if err := client.Put(ctx, "default", []byte(s)); err != nil {
+			t.Fatalf("Put(%s): %v", s, err)
+		}
+		client.Close()
+	}
+
+	repo.tags.Store(0)
+	repo.resolve.Store(0)
+	repo.fetch.Store(0)
+
+	versions, err := client.ListVersions(ctx, "default")
+	if err != nil {
+		t.Fatalf("ListVersions: %v", err)
+	}
+	if len(versions) != 3 {
+		t.Fatalf("len(versions) = %d, want 3", len(versions))
+	}
+	// 1 tag listing (reused from preflight) and 1 preflight state fetch + 3 version fetches = 4.
+	if tags, fetch := repo.tags.Load(), repo.fetch.Load(); tags != 1 || fetch != 4 {
+		t.Fatalf("ListVersions calls: Tags=%d Fetch=%d; want 1, 4", tags, fetch)
+	}
+}

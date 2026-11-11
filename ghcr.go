@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -49,7 +50,37 @@ type githubPackageVersion struct {
 	} `json:"metadata"`
 }
 
+type ghcrEndpointPages struct {
+	notFound  bool
+	versions  []githubPackageVersion
+	nextPage  int
+	exhausted bool
+}
+
+// ghcrVersionCache reuses already-fetched GitHub Packages version pages across
+// a single multi-tag operation (DeleteWorkspace) so N deletions page the
+// package history once instead of N times. A nil cache disables reuse.
+type ghcrVersionCache struct {
+	endpoints map[string]*ghcrEndpointPages
+}
+
+func (c *ghcrVersionCache) endpoint(baseURL string) *ghcrEndpointPages {
+	if c.endpoints == nil {
+		c.endpoints = make(map[string]*ghcrEndpointPages, 2)
+	}
+	ep, ok := c.endpoints[baseURL]
+	if !ok {
+		ep = &ghcrEndpointPages{nextPage: 1}
+		c.endpoints[baseURL] = ep
+	}
+	return ep
+}
+
 func tryDeleteGHCRTag(ctx context.Context, repo *orasRepositoryClient, tag, expectedDigest string) error {
+	return tryDeleteGHCRTagCached(ctx, repo, tag, expectedDigest, nil)
+}
+
+func tryDeleteGHCRTagCached(ctx context.Context, repo *orasRepositoryClient, tag, expectedDigest string, cache *ghcrVersionCache) error {
 	if repo == nil {
 		return fmt.Errorf("nil repository client")
 	}
@@ -75,7 +106,7 @@ func tryDeleteGHCRTag(ctx context.Context, repo *orasRepositoryClient, tag, expe
 		client = &http.Client{}
 	}
 
-	return deleteGitHubPackageVersionByTag(ctx, client, githubAPIBaseURL, owner, packageName, tag, token, expectedDigest)
+	return deleteGitHubPackageVersionByTagCached(ctx, client, githubAPIBaseURL, owner, packageName, tag, token, expectedDigest, cache)
 }
 
 func parseGHCRRepository(repository string) (host, owner, packageName string, err error) {
@@ -96,32 +127,45 @@ func parseGHCRRepository(repository string) (host, owner, packageName string, er
 }
 
 func deleteGitHubPackageVersionByTag(ctx context.Context, client *http.Client, baseURL, owner, packageName, tag, token, expectedDigest string) error {
+	return deleteGitHubPackageVersionByTagCached(ctx, client, baseURL, owner, packageName, tag, token, expectedDigest, nil)
+}
+
+func deleteGitHubPackageVersionByTagCached(ctx context.Context, client *http.Client, baseURL, owner, packageName, tag, token, expectedDigest string, cache *ghcrVersionCache) error {
 	baseURL = strings.TrimRight(baseURL, "/")
 	pkgEscaped := url.PathEscape(packageName)
 	ownerEscaped := url.PathEscape(owner)
 
 	orgBase := fmt.Sprintf("%s/orgs/%s/packages/container/%s", baseURL, ownerEscaped, pkgEscaped)
-	if err := deleteFromGitHubPackagesEndpoint(ctx, client, orgBase, tag, token, expectedDigest); err == nil {
+	if err := deleteFromGitHubPackagesEndpointCached(ctx, client, orgBase, tag, token, expectedDigest, cache); err == nil {
 		return nil
 	} else if !isHTTPStatus(err, http.StatusNotFound) {
 		return err
 	}
 
 	userBase := fmt.Sprintf("%s/users/%s/packages/container/%s", baseURL, ownerEscaped, pkgEscaped)
-	return deleteFromGitHubPackagesEndpoint(ctx, client, userBase, tag, token, expectedDigest)
+	return deleteFromGitHubPackagesEndpointCached(ctx, client, userBase, tag, token, expectedDigest, cache)
 }
 
-func deleteFromGitHubPackagesEndpoint(ctx context.Context, client *http.Client, baseURL, tag, token, expectedDigest string) error {
-	versionID, err := findGitHubVersionIDByTag(ctx, client, baseURL, tag, token, expectedDigest)
+func deleteFromGitHubPackagesEndpointCached(ctx context.Context, client *http.Client, baseURL, tag, token, expectedDigest string, cache *ghcrVersionCache) error {
+	versionID, err := findGitHubVersionIDCached(ctx, client, baseURL, tag, token, expectedDigest, cache)
 	if err != nil {
 		return err
 	}
 	if versionID == 0 {
-		return newHTTPStatusError(http.StatusNotFound, "no package version matching tag and digest")
+		return httpStatusErr{code: http.StatusNotFound, op: "no package version matching tag and digest"}
 	}
 
 	deleteURL := fmt.Sprintf("%s/versions/%d", baseURL, versionID)
-	return deleteGitHubPackageVersionWithRetry(ctx, client, deleteURL, token)
+	if err := deleteGitHubPackageVersionWithRetry(ctx, client, deleteURL, token); err != nil {
+		return err
+	}
+	if cache != nil {
+		ep := cache.endpoint(baseURL)
+		ep.versions = slices.DeleteFunc(ep.versions, func(v githubPackageVersion) bool {
+			return v.ID == versionID
+		})
+	}
+	return nil
 }
 
 // deleteGitHubPackageVersionWithRetry issues the package-version DELETE and,
@@ -159,20 +203,48 @@ func deleteGitHubPackageVersionWithRetry(ctx context.Context, client *http.Clien
 // (fewer than githubVersionsPerPage entries means the API returned
 // everything); context cancellation surfaces as an error.
 func findGitHubVersionIDByTag(ctx context.Context, client *http.Client, baseURL, tag, token, expectedDigest string) (int64, error) {
-	for page := 1; ; page++ {
-		versions, err := listGitHubPackageVersions(ctx, client, baseURL, page, token)
+	return findGitHubVersionIDCached(ctx, client, baseURL, tag, token, expectedDigest, nil)
+}
+
+func findGitHubVersionIDCached(ctx context.Context, client *http.Client, baseURL, tag, token, expectedDigest string, cache *ghcrVersionCache) (int64, error) {
+	if cache == nil {
+		return scanEndpointPages(ctx, client, baseURL, tag, token, expectedDigest, &ghcrEndpointPages{nextPage: 1}, false)
+	}
+	ep := cache.endpoint(baseURL)
+	if ep.notFound {
+		return 0, httpStatusErr{code: http.StatusNotFound, op: "list package versions"}
+	}
+	hadCached := len(ep.versions) > 0 || ep.exhausted
+	if id, err := scanEndpointPages(ctx, client, baseURL, tag, token, expectedDigest, ep, true); err != nil || id != 0 || !hadCached {
+		return id, err
+	}
+	// A tag published mid-operation (such as an unlock anchor) was not in the
+	// earlier pages: refresh once before reporting 404.
+	*ep = ghcrEndpointPages{nextPage: 1}
+	return scanEndpointPages(ctx, client, baseURL, tag, token, expectedDigest, ep, true)
+}
+
+func scanEndpointPages(ctx context.Context, client *http.Client, baseURL, tag, token, expectedDigest string, ep *ghcrEndpointPages, retain bool) (int64, error) {
+	if id := findVersionIDWithTag(ep.versions, tag, expectedDigest); id != 0 {
+		return id, nil
+	}
+	for !ep.exhausted {
+		versions, err := listGitHubPackageVersions(ctx, client, baseURL, ep.nextPage, token)
 		if err != nil {
+			if ep.nextPage == 1 && isHTTPStatus(err, http.StatusNotFound) {
+				ep.notFound = true
+			}
 			return 0, err
 		}
-		if len(versions) == 0 {
-			break
+		ep.nextPage++
+		if retain {
+			ep.versions = append(ep.versions, versions...)
 		}
-
+		if len(versions) == 0 || len(versions) < githubVersionsPerPage {
+			ep.exhausted = true
+		}
 		if id := findVersionIDWithTag(versions, tag, expectedDigest); id != 0 {
 			return id, nil
-		}
-		if len(versions) < githubVersionsPerPage {
-			break
 		}
 	}
 	return 0, nil
@@ -200,13 +272,8 @@ func listGitHubPackageVersions(ctx context.Context, client *http.Client, baseURL
 // different digest, digest hit without the tag — is not a match.
 func findVersionIDWithTag(versions []githubPackageVersion, tag, expectedDigest string) int64 {
 	for _, v := range versions {
-		if v.Name != expectedDigest {
-			continue
-		}
-		for _, t := range v.Metadata.Container.Tags {
-			if t == tag {
-				return v.ID
-			}
+		if v.Name == expectedDigest && slices.Contains(v.Metadata.Container.Tags, tag) {
+			return v.ID
 		}
 	}
 	return 0
@@ -221,7 +288,6 @@ func githubRequest(ctx context.Context, client *http.Client, method, urlStr, tok
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", githubAPIVersion)
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("User-Agent", userAgent())
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -230,9 +296,7 @@ func githubRequest(ctx context.Context, client *http.Client, method, urlStr, tok
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != expectedStatus {
-		// Drain the body so the underlying TCP connection can be reused (HTTP/1.1 keep-alive).
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return newHTTPStatusError(resp.StatusCode, operation)
+		return httpStatusErr{code: resp.StatusCode, op: operation, detail: readGitHubErrorDetail(resp.Body)}
 	}
 	if decode == nil {
 		return nil
@@ -240,17 +304,30 @@ func githubRequest(ctx context.Context, client *http.Client, method, urlStr, tok
 	return json.NewDecoder(resp.Body).Decode(decode)
 }
 
+func readGitHubErrorDetail(r io.Reader) string {
+	head, _ := io.ReadAll(io.LimitReader(r, 1024))
+	// Drain any remainder so the underlying TCP connection can be reused (HTTP/1.1 keep-alive).
+	_, _ = io.Copy(io.Discard, r)
+	var payload struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(head, &payload) == nil && payload.Message != "" {
+		return payload.Message
+	}
+	return strings.TrimSpace(string(head))
+}
+
 type httpStatusErr struct {
-	code int
-	op   string
+	code   int
+	op     string
+	detail string
 }
 
 func (e httpStatusErr) Error() string {
+	if e.detail != "" {
+		return fmt.Sprintf("github api error (%s): status %d: %s", e.op, e.code, e.detail)
+	}
 	return fmt.Sprintf("github api error (%s): status %d", e.op, e.code)
-}
-
-func newHTTPStatusError(code int, op string) error {
-	return httpStatusErr{code: code, op: op}
 }
 
 func isHTTPStatus(err error, code int) bool {
@@ -259,4 +336,9 @@ func isHTTPStatus(err error, code int) bool {
 		return e.code == code
 	}
 	return false
+}
+
+func isGHCRDeleteBadRequest(err error) bool {
+	var e httpStatusErr
+	return errors.As(err, &e) && e.code == http.StatusBadRequest && e.op == "delete package version"
 }

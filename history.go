@@ -38,11 +38,12 @@ func (c *Client) ListVersions(ctx context.Context, stateID string) ([]StateVersi
 	defer cancel()
 
 	wc := newWorkspaceClient(c, stateID)
-	if _, err := wc.checkWorkspace(ctx); err != nil {
+	obs, err := wc.checkWorkspace(ctx)
+	if err != nil {
 		return nil, err
 	}
 
-	versions, err := wc.verifiedVersions(ctx)
+	versions, err := wc.observedOrListedVersions(ctx, obs)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, nil
@@ -56,7 +57,7 @@ func (c *Client) ListVersions(ctx context.Context, stateID string) ([]StateVersi
 		reference := wc.versionTagFor(version)
 		fm, desc, err := wc.fetchManifestWithDesc(ctx, reference)
 		if err != nil {
-			if isNotFound(err) {
+			if isNotFound(err) && !isMissingContent(err) {
 				continue
 			}
 			return nil, err

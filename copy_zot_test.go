@@ -33,7 +33,8 @@ func TestZotIntegration_Copy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanCopy: %v", err)
 	}
-	if len(plan.Artifacts) == 0 {
+	artifacts := plan.Artifacts()
+	if len(artifacts) == 0 {
 		t.Fatal("plan has no artifacts")
 	}
 
@@ -42,11 +43,11 @@ func TestZotIntegration_Copy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CopyTo: %v", err)
 	}
-	if len(report.Copied) != len(plan.Artifacts) {
+	if len(report.Copied) != len(artifacts) {
 		t.Fatalf("copied = %v, want %v", copyArtifactTags(report.Copied), copyPlanTags(plan))
 	}
 
-	for _, artifact := range plan.Artifacts {
+	for _, artifact := range artifacts {
 		tag := artifact.Tag
 		srcDesc, err := src.repoClient.inner.Resolve(ctx, tag)
 		if err != nil {

@@ -1,13 +1,12 @@
 package orasstate
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,11 +63,8 @@ func (wc *workspaceClient) checkLegacyWorkspace(ctx context.Context) (workspaceO
 }
 
 func listLegacyWorkspaces(ctx context.Context, repo *orasRepositoryClient) ([]string, error) {
-	var tags []string
-	if err := repo.inner.Tags(ctx, "", func(page []string) error {
-		tags = append(tags, page...)
-		return nil
-	}); err != nil {
+	tags, err := listRepoTags(ctx, repo.inner)
+	if err != nil {
 		if isNotFound(err) {
 			return []string{"default"}, nil
 		}
@@ -105,11 +101,8 @@ func listLegacyWorkspaces(ctx context.Context, repo *orasRepositoryClient) ([]st
 
 	var validateLegacyTags []legacyVersionCandidate
 	for _, candidates := range ambiguousByBase {
-		sort.Slice(candidates, func(i, j int) bool {
-			if candidates[i].version == candidates[j].version {
-				return candidates[i].tag < candidates[j].tag
-			}
-			return candidates[i].version < candidates[j].version
+		slices.SortFunc(candidates, func(a, b legacyVersionCandidate) int {
+			return cmp.Or(cmp.Compare(a.version, b.version), cmp.Compare(a.tag, b.tag))
 		})
 		if len(candidates) <= legacyVersionWorkspaceValidationLimitPerBase {
 			validateLegacyTags = append(validateLegacyTags, candidates...)
@@ -127,7 +120,6 @@ func listLegacyWorkspaces(ctx context.Context, repo *orasRepositoryClient) ([]st
 	group.SetLimit(10)
 
 	for _, tag := range relevantTags {
-		tag := tag
 		group.Go(func() error {
 			name, err := legacyWorkspaceNameFromTag(groupCtx, repo, tag)
 			if err != nil {
@@ -142,7 +134,6 @@ func listLegacyWorkspaces(ctx context.Context, repo *orasRepositoryClient) ([]st
 		})
 	}
 	for _, candidate := range validateLegacyTags {
-		candidate := candidate
 		group.Go(func() error {
 			isVersion, err := legacyStateVersionTagMatchesStateTag(groupCtx, repo, candidate.tag, candidate.base, candidate.version)
 			if err != nil {
@@ -168,16 +159,10 @@ func listLegacyWorkspaces(ctx context.Context, repo *orasRepositoryClient) ([]st
 		return nil, err
 	}
 	if len(out) == 0 {
-		out = append(out, "default")
+		return []string{"default"}, nil
 	}
-	sort.Strings(out)
-	dedup := out[:1]
-	for i := 1; i < len(out); i++ {
-		if out[i] != out[i-1] {
-			dedup = append(dedup, out[i])
-		}
-	}
-	return dedup, nil
+	slices.Sort(out)
+	return slices.Compact(out), nil
 }
 
 func splitLegacyStateVersionTag(tag string) (base string, version int, ok bool) {
@@ -198,9 +183,9 @@ func splitLegacyStateVersionTag(tag string) (base string, version int, ok bool) 
 }
 
 func legacyStateVersionTagMatchesStateTag(ctx context.Context, repo *orasRepositoryClient, tag, expectedStateTag string, expectedVersion int) (bool, error) {
-	m, err := fetchRawManifest(ctx, repo, tag)
+	m, _, err := resolveAndFetchManifest(ctx, repo.inner, tag)
 	if err != nil {
-		if isNotFound(err) {
+		if isNotFound(err) && !isMissingContent(err) {
 			return false, nil
 		}
 		return false, err
@@ -233,7 +218,7 @@ func legacyWorkspaceNameFromTag(ctx context.Context, repo *orasRepositoryClient,
 	if !strings.HasPrefix(wsTag, "ws-") {
 		return wsTag, nil
 	}
-	m, err := fetchRawManifest(ctx, repo, stateTag)
+	m, _, err := resolveAndFetchManifest(ctx, repo.inner, stateTag)
 	if err != nil {
 		return "", err
 	}
@@ -241,29 +226,4 @@ func legacyWorkspaceNameFromTag(ctx context.Context, repo *orasRepositoryClient,
 		return name, nil
 	}
 	return wsTag, nil
-}
-
-func fetchRawManifest(ctx context.Context, repo *orasRepositoryClient, reference string) (ocispec.Manifest, error) {
-	desc, err := repo.inner.Resolve(ctx, reference)
-	if err != nil {
-		return ocispec.Manifest{}, err
-	}
-	rc, err := repo.inner.Fetch(ctx, desc)
-	if err != nil {
-		return ocispec.Manifest{}, err
-	}
-	defer func() { _ = rc.Close() }()
-
-	data, err := io.ReadAll(io.LimitReader(rc, maxManifestSize))
-	if err != nil {
-		return ocispec.Manifest{}, err
-	}
-	var manifest ocispec.Manifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return ocispec.Manifest{}, fmt.Errorf("decoding manifest %q: %w", reference, err)
-	}
-	if manifest.Annotations == nil {
-		manifest.Annotations = map[string]string{}
-	}
-	return manifest, nil
 }

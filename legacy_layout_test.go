@@ -92,3 +92,37 @@ func TestLegacyDeleteWorkspaceRemovesStateHistoryAndLock(t *testing.T) {
 		}
 	}
 }
+
+func TestLegacyDeleteWorkspacePreservesSiblingVersionedWorkspace(t *testing.T) {
+	ctx := context.Background()
+	c := newTestClient(&orasRepositoryClient{inner: newFakeORASRepo()})
+	c.config.WorkspaceLayout = WorkspaceLayoutLegacy
+	c.config.MaxVersions = 5
+
+	for _, s := range []string{"prod-1", "prod-2"} {
+		if err := c.Put(ctx, "prod", []byte(s)); err != nil {
+			t.Fatalf("Put prod: %v", err)
+		}
+	}
+	for _, s := range []string{"v2-1", "v2-2"} {
+		if err := c.Put(ctx, "prod-v2", []byte(s)); err != nil {
+			t.Fatalf("Put prod-v2: %v", err)
+		}
+	}
+	c.Close()
+
+	if err := c.DeleteWorkspace(ctx, "prod"); err != nil {
+		t.Fatalf("DeleteWorkspace(prod): %v", err)
+	}
+
+	got, err := c.Get(ctx, "prod-v2")
+	if err != nil || string(got) != "v2-2" {
+		t.Fatalf("Get(prod-v2) = %q, %v; want %q", got, err, "v2-2")
+	}
+	for i, want := range []string{"v2-1", "v2-2"} {
+		v, err := c.GetVersion(ctx, "prod-v2", i+1)
+		if err != nil || string(v) != want {
+			t.Fatalf("GetVersion(prod-v2, %d) = %q, %v; want %q", i+1, v, err, want)
+		}
+	}
+}

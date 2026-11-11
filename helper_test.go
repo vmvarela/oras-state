@@ -114,6 +114,16 @@ func (r *fakeORASRepo) Tag(ctx context.Context, desc ocispec.Descriptor, referen
 	return nil
 }
 
+func (r *fakeORASRepo) PushReference(ctx context.Context, expected ocispec.Descriptor, content io.Reader, reference string) error {
+	if err := r.Push(ctx, expected, content); err != nil {
+		return err
+	}
+	if _, err := digest.Parse(reference); err == nil {
+		return nil
+	}
+	return r.Tag(ctx, expected, reference)
+}
+
 func (r *fakeORASRepo) Delete(ctx context.Context, target ocispec.Descriptor) error {
 	_ = ctx
 

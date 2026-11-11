@@ -102,11 +102,7 @@ func fetchFake(t *testing.T, repo *fakeORASRepo, desc ocispec.Descriptor) []byte
 }
 
 func copyPlanTags(plan *CopyPlan) []string {
-	tags := make([]string, len(plan.Artifacts))
-	for i, artifact := range plan.Artifacts {
-		tags[i] = artifact.Tag
-	}
-	return tags
+	return copyArtifactTags(plan.Artifacts())
 }
 
 func copyArtifactTags(artifacts []CopyArtifact) []string {
@@ -119,7 +115,7 @@ func copyArtifactTags(artifacts []CopyArtifact) []string {
 
 func copyArtifactByTag(t *testing.T, plan *CopyPlan, tag string) CopyArtifact {
 	t.Helper()
-	for _, artifact := range plan.Artifacts {
+	for _, artifact := range plan.Artifacts() {
 		if artifact.Tag == tag {
 			return artifact
 		}
@@ -145,8 +141,8 @@ func TestCopyPlanAndCopyTo_PreservesTagsAndDigests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanCopy: %v", err)
 	}
-	if plan.Source != "example/src" {
-		t.Fatalf("plan source = %q, want example/src", plan.Source)
+	if plan.Source() != "example/src" {
+		t.Fatalf("plan source = %q, want example/src", plan.Source())
 	}
 	wantTags := []string{
 		"custom-alias",
@@ -159,8 +155,8 @@ func TestCopyPlanAndCopyTo_PreservesTagsAndDigests(t *testing.T) {
 	if got := copyPlanTags(plan); !slices.Equal(got, wantTags) {
 		t.Fatalf("plan tags = %v, want %v", got, wantTags)
 	}
-	if !slices.Contains(plan.Skipped, tombstoneTag) {
-		t.Fatalf("plan skipped = %v, want %q", plan.Skipped, tombstoneTag)
+	if !slices.Contains(plan.Skipped(), tombstoneTag) {
+		t.Fatalf("plan skipped = %v, want %q", plan.Skipped(), tombstoneTag)
 	}
 	if _, ok := plan.snapshot[tombstoneTag]; !ok {
 		t.Fatal("source snapshot must include skipped tombstones")
@@ -194,8 +190,8 @@ func TestCopyPlanAndCopyTo_PreservesTagsAndDigests(t *testing.T) {
 	if len(report.Existing) != 0 {
 		t.Fatalf("existing = %v, want none", report.Existing)
 	}
-	if len(report.Verified) != len(plan.Artifacts) {
-		t.Fatalf("verified = %d, want %d", len(report.Verified), len(plan.Artifacts))
+	if len(report.Verified) != len(plan.Artifacts()) {
+		t.Fatalf("verified = %d, want %d", len(report.Verified), len(plan.Artifacts()))
 	}
 
 	for _, tag := range copyPlanTags(plan) {
@@ -326,11 +322,11 @@ func TestCopyTo_ResumesMatchingSubset(t *testing.T) {
 	if got := copyArtifactTags(report.Copied); !slices.Equal(got, []string{removed}) {
 		t.Fatalf("copied = %v, want [%q]", got, removed)
 	}
-	if len(report.Existing) != len(plan.Artifacts)-1 {
-		t.Fatalf("existing = %v, want %d tags", report.Existing, len(plan.Artifacts)-1)
+	if len(report.Existing) != len(plan.Artifacts())-1 {
+		t.Fatalf("existing = %v, want %d tags", report.Existing, len(plan.Artifacts())-1)
 	}
-	if len(report.Verified) != len(plan.Artifacts) {
-		t.Fatalf("verified = %d, want %d", len(report.Verified), len(plan.Artifacts))
+	if len(report.Verified) != len(plan.Artifacts()) {
+		t.Fatalf("verified = %d, want %d", len(report.Verified), len(plan.Artifacts()))
 	}
 	for _, tag := range copyPlanTags(plan) {
 		resolveFake(t, dstRepo, tag)
@@ -382,7 +378,7 @@ func TestCopyTo_DetectsSourceChangeDuringCopy(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "source changed") {
 		t.Fatalf("CopyTo with a source change = %v, want source-changed error", err)
 	}
-	if report == nil || len(report.Copied) != len(plan.Artifacts) {
+	if report == nil || len(report.Copied) != len(plan.Artifacts()) {
 		t.Fatalf("report = %+v, want all tags copied before the final check", report)
 	}
 	for _, tag := range copyPlanTags(plan) {
@@ -505,35 +501,44 @@ func TestCopyTo_RejectsSameRepositoryAndLayoutMismatch(t *testing.T) {
 	}
 }
 
-func TestCopyTo_RejectsMutatedOrForeignPlan(t *testing.T) {
+func TestCopyTo_RejectsForeignOrUninitializedPlanAndDefensiveCopies(t *testing.T) {
 	ctx := context.Background()
-	src, _ := newCopyClient(t, "example/src", WorkspaceLayoutHashed)
+	src, srcRepo := newCopyClient(t, "example/src", WorkspaceLayoutHashed)
 	seedCopySource(t, src)
+	markerTag := unlockedTagPrefix + workspaceTagFor("gone")
+	addCopyUnlockMarker(t, src, srcRepo, markerTag, "gone")
 
-	mutations := []struct {
-		name   string
-		mutate func(*CopyArtifact)
-	}{
-		{"digest", func(a *CopyArtifact) { a.Descriptor.Digest = digest.FromString("forged") }},
-		{"size", func(a *CopyArtifact) { a.Descriptor.Size++ }},
-		{"media type", func(a *CopyArtifact) { a.Descriptor.MediaType = "application/vnd.forged" }},
-	}
-	for _, mutation := range mutations {
-		t.Run(mutation.name, func(t *testing.T) {
-			plan, err := src.PlanCopy(ctx)
-			if err != nil {
-				t.Fatalf("PlanCopy: %v", err)
-			}
-			dst, dstRepo := newCopyClient(t, "example/dst", WorkspaceLayoutHashed)
-			mutation.mutate(&plan.Artifacts[0])
-			if _, err := src.CopyTo(ctx, dst, plan); err == nil || !strings.Contains(err.Error(), "inconsistent") {
-				t.Fatalf("CopyTo with a mutated plan = %v, want refusal", err)
-			}
-			if len(dstRepo.tags) != 0 {
-				t.Fatalf("destination was written for a mutated plan: %v", dstRepo.tags)
-			}
-		})
-	}
+	t.Run("defensive copies keep plan immutable", func(t *testing.T) {
+		plan, err := src.PlanCopy(ctx)
+		if err != nil {
+			t.Fatalf("PlanCopy: %v", err)
+		}
+		artifacts := plan.Artifacts()
+		artifacts[0].Descriptor.Digest = digest.FromString("forged")
+		artifacts[0].Descriptor.Size++
+		artifacts[0].Kind = ArtifactKindUnknown
+		skipped := plan.Skipped()
+		skipped[0] = "forged-skip"
+
+		dst, dstRepo := newCopyClient(t, "example/dst", WorkspaceLayoutHashed)
+		report, err := src.CopyTo(ctx, dst, plan)
+		if err != nil {
+			t.Fatalf("CopyTo after mutating accessor slices: %v", err)
+		}
+		if len(report.Verified) != len(plan.Artifacts()) {
+			t.Fatalf("verified = %d, want %d", len(report.Verified), len(plan.Artifacts()))
+		}
+		if _, err := dstRepo.Resolve(ctx, markerTag); !errors.Is(err, errdef.ErrNotFound) {
+			t.Fatalf("skipped marker %q was copied: %v", markerTag, err)
+		}
+	})
+
+	t.Run("uninitialized plan", func(t *testing.T) {
+		dst, _ := newCopyClient(t, "example/dst", WorkspaceLayoutHashed)
+		if _, err := src.CopyTo(ctx, dst, &CopyPlan{}); err == nil || !strings.Contains(err.Error(), "no source snapshot") {
+			t.Fatalf("CopyTo with zero CopyPlan = %v, want snapshot error", err)
+		}
+	})
 
 	t.Run("foreign plan", func(t *testing.T) {
 		dst, _ := newCopyClient(t, "example/dst", WorkspaceLayoutHashed)
@@ -733,8 +738,8 @@ func TestPlanCopy_DoesNotInjectDeadline(t *testing.T) {
 	if _, err := c.PlanCopy(context.Background()); err != nil {
 		t.Fatalf("PlanCopy: %v", err)
 	}
-	if len(repo.deadlines) == 0 {
-		t.Fatal("PlanCopy listed no tags")
+	if len(repo.deadlines) != 1 {
+		t.Fatalf("PlanCopy tag listings = %d, want 1", len(repo.deadlines))
 	}
 	for i, has := range repo.deadlines {
 		if has {
@@ -841,7 +846,7 @@ func TestCopyTo_DetectsDestinationUnexpectedTagAfterCopy(t *testing.T) {
 		delegatingRepo: delegatingRepo{inner: dstInner},
 		remaining:      2,
 		mutate: func(repo *fakeORASRepo) {
-			repo.tags["late-dest"] = plan.Artifacts[0].Descriptor
+			repo.tags["late-dest"] = plan.Artifacts()[0].Descriptor
 		},
 	}
 	dst := &Client{
@@ -854,7 +859,7 @@ func TestCopyTo_DetectsDestinationUnexpectedTagAfterCopy(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "unexpected tag") {
 		t.Fatalf("CopyTo with a late destination tag = %v, want final-inventory refusal", err)
 	}
-	if report == nil || len(report.Copied) != len(plan.Artifacts) {
+	if report == nil || len(report.Copied) != len(plan.Artifacts()) {
 		t.Fatalf("report = %+v, want all planned tags copied before the final check", report)
 	}
 	if _, err := dstInner.Resolve(ctx, "late-dest"); err != nil {
@@ -870,12 +875,13 @@ func TestCopyTo_DetectsDestinationTagMovementAfterCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanCopy: %v", err)
 	}
-	if len(plan.Artifacts) < 2 {
+	artifacts := plan.Artifacts()
+	if len(artifacts) < 2 {
 		t.Fatal("need at least two planned artifacts")
 	}
 
-	moveTag := plan.Artifacts[0].Tag
-	moveDesc := plan.Artifacts[1].Descriptor
+	moveTag := artifacts[0].Tag
+	moveDesc := artifacts[1].Descriptor
 	dstInner := newFakeORASRepo()
 	late := &lateDestMutationRepo{
 		delegatingRepo: delegatingRepo{inner: dstInner},
@@ -981,8 +987,8 @@ func TestCopyAfterRealUnlockOnDeleteUnsupportedRegistry(t *testing.T) {
 				t.Fatalf("PlanCopy after a real unlock on a registry that rejects DELETE: %v", err)
 			}
 			for _, tag := range []string{lockTag, unlockedTag} {
-				if !slices.Contains(plan.Skipped, tag) {
-					t.Fatalf("plan skipped = %v, want validated marker %q", plan.Skipped, tag)
+				if !slices.Contains(plan.Skipped(), tag) {
+					t.Fatalf("plan skipped = %v, want validated marker %q", plan.Skipped(), tag)
 				}
 				if _, ok := plan.snapshot[tag]; !ok {
 					t.Fatalf("plan snapshot is missing skipped marker %q", tag)
@@ -994,7 +1000,7 @@ func TestCopyAfterRealUnlockOnDeleteUnsupportedRegistry(t *testing.T) {
 			if err != nil {
 				t.Fatalf("CopyTo after a real unlock: %v", err)
 			}
-			if len(report.Copied) != len(plan.Artifacts) {
+			if len(report.Copied) != len(plan.Artifacts()) {
 				t.Fatalf("copied = %v, want %v", copyArtifactTags(report.Copied), copyPlanTags(plan))
 			}
 			for _, tag := range []string{lockTag, unlockedTag} {
@@ -1202,10 +1208,10 @@ func TestCopyPlan_ValidatesUnlockMarkersByContent(t *testing.T) {
 						if err != nil {
 							t.Fatalf("PlanCopy for a valid marker: %v", err)
 						}
-						if !slices.Contains(plan.Skipped, tag) {
-							t.Fatalf("plan skipped = %v, want %q", plan.Skipped, tag)
+						if !slices.Contains(plan.Skipped(), tag) {
+							t.Fatalf("plan skipped = %v, want %q", plan.Skipped(), tag)
 						}
-						for _, artifact := range plan.Artifacts {
+						for _, artifact := range plan.Artifacts() {
 							if artifact.Tag == tag {
 								t.Fatalf("marker %q was planned for copying", tag)
 							}
@@ -1302,72 +1308,6 @@ func TestCopyTo_DetectsSkippedAliasChange(t *testing.T) {
 	}
 	if len(dstRepo.tags) != 0 {
 		t.Fatalf("destination was written before the marker change was refused: %v", dstRepo.tags)
-	}
-}
-
-// TestCopyTo_RejectsTamperedKindAndSkipped proves exported plan fields cannot
-// forge a kind or drop a skipped marker.
-func TestCopyTo_RejectsTamperedKindAndSkipped(t *testing.T) {
-	ctx := context.Background()
-	src, srcRepo := newCopyClient(t, "example/src", WorkspaceLayoutLegacy)
-	seedCopySource(t, src)
-	markerTag := unlockedTagPrefix + src.workspaceTagFor("gone")
-	addCopyUnlockMarker(t, src, srcRepo, markerTag, "gone")
-	historyTag := stateTagPrefix + "foo" + stateVersionTagSeparator + "1"
-	addCopyLegacyHistory(t, src, srcRepo, historyTag, "foo", "1")
-
-	tests := []struct {
-		name    string
-		mutate  func(*CopyPlan)
-		wantErr string
-	}{
-		{
-			name: "exported kind",
-			mutate: func(plan *CopyPlan) {
-				for i := range plan.Artifacts {
-					if plan.Artifacts[i].Tag == historyTag {
-						plan.Artifacts[i].Kind = ArtifactKindState
-					}
-				}
-			},
-			wantErr: "inconsistent kind",
-		},
-		{
-			name: "dropped skipped tag",
-			mutate: func(plan *CopyPlan) {
-				plan.Skipped = slices.DeleteFunc(plan.Skipped, func(tag string) bool { return tag == markerTag })
-			},
-			wantErr: "skipped tags do not match",
-		},
-		{
-			name: "skipped tag copied",
-			mutate: func(plan *CopyPlan) {
-				plan.Artifacts = append(plan.Artifacts, CopyArtifact{
-					Tag:        markerTag,
-					Descriptor: plan.snapshot[markerTag],
-					Kind:       ArtifactKindUnknown,
-				})
-			},
-			wantErr: "inconsistent kind",
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			plan, err := src.PlanCopy(ctx)
-			if err != nil {
-				t.Fatalf("PlanCopy: %v", err)
-			}
-			tc.mutate(plan)
-
-			dst, dstRepo := newCopyClient(t, "example/dst", WorkspaceLayoutLegacy)
-			if _, err := src.CopyTo(ctx, dst, plan); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("CopyTo with tampered plan = %v, want %q", err, tc.wantErr)
-			}
-			if len(dstRepo.tags) != 0 {
-				t.Fatalf("destination was written for a tampered plan: %v", dstRepo.tags)
-			}
-		})
 	}
 }
 
