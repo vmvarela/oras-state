@@ -43,8 +43,9 @@ The mandatory CI target. Tests run PlainHTTP without authentication, using eithe
 
 ## Mutable tags and concurrency
 
-OCI tags are last-writer-wins with no compare-and-swap. The engine:
+OCI tags are last-writer-wins with no compare-and-swap. The CAS/conditional-write investigation for issue #11 is recorded in [cas-investigation.md](cas-investigation.md); its conclusion is that OCI defines no portable conditional-update mechanism and the current fail-closed model remains the contract.
 
+The engine:
 - treats a moved mutable tag as a fail-closed error (`ErrMutableTagMoved`) when a transient failure leaves the outcome ambiguous, and
 - retries a bounded number of times before publishing; the retry may overwrite a rival writer's tag (documented limitation, see the README).
 
