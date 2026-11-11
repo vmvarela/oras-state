@@ -18,7 +18,11 @@ import (
 func seedManifest(t *testing.T, repo *fakeORASRepo, tag string) ocispec.Descriptor {
 	t.Helper()
 	ctx := context.Background()
-	desc, err := oras.PackManifest(ctx, repo, oras.PackManifestVersion1_1, "application/vnd.test.state", oras.PackManifestOptions{})
+	// The tag goes into the manifest so each seeded tag has its own digest,
+	// like real state, marker and history artifacts do.
+	desc, err := oras.PackManifest(ctx, repo, oras.PackManifestVersion1_1, "application/vnd.test.state", oras.PackManifestOptions{
+		ManifestAnnotations: map[string]string{"test.tag": tag},
+	})
 	if err != nil {
 		t.Fatalf("pack manifest: %v", err)
 	}
@@ -219,4 +223,45 @@ func testWorkspaceTag(t *testing.T, workspace string) string {
 	t.Helper()
 	c := &Client{}
 	return c.workspaceTagFor(workspace)
+}
+
+func TestPurge_ApplyDeletesExcessHistoryWithLiveTags(t *testing.T) {
+	repo := newFakeORASRepo()
+	id := testWorkspaceTag(t, "default")
+	seedManifest(t, repo, "state-"+id)
+	seedManifest(t, repo, "wsmeta-"+id)
+
+	var versions []githubPackageVersion
+	for i := 1; i <= 4; i++ {
+		tag := fmt.Sprintf("stver-%s-v%d", id, i)
+		desc := seedManifest(t, repo, tag)
+		versions = append(versions, purgeVersion(int64(i), desc.Digest.String(), []string{tag}, time.Hour))
+	}
+
+	var deleted []string
+	c := newPurgeClient(t, repo, 2, func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodDelete {
+			deleted = append(deleted, r.URL.Path)
+			return fakeGitHubResponse(http.StatusNoContent, ""), nil
+		}
+		return fakeGitHubResponse(http.StatusOK, purgeVersionsBody(versions)), nil
+	})
+
+	report, err := c.Purge(context.Background(), PurgeOptions{Apply: true})
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+
+	t.Logf("DEBUG candidates=%+v skipped=%v kept=%d", report.Candidates, report.Skipped, report.KeptTagged)
+
+	// A candidate's own history tag is still live; that must not stop the delete.
+	if len(deleted) != 2 || !strings.HasSuffix(deleted[0], "/versions/1") || !strings.HasSuffix(deleted[1], "/versions/2") {
+		t.Fatalf("deleted paths = %v, want versions 1 and 2", deleted)
+	}
+	if len(report.Deleted) != 2 {
+		t.Errorf("report.Deleted = %+v, want 2 versions", report.Deleted)
+	}
+	if len(report.Skipped) != 0 {
+		t.Errorf("Skipped = %v, want none", report.Skipped)
+	}
 }
