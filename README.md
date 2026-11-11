@@ -120,6 +120,37 @@ Before relying on the new retention behavior, stop old writers and wait for thei
 
 The API deliberately exposes logical versions and verified manifest digests, not OCI tag names. It is read-only: restore, per-version deletion, and garbage collection are outside this contract.
 
+## Copying state to another repository
+
+`PlanCopy` and `CopyTo` migrate a repository to another one. The copy works on OCI graphs, so state bytes are never decoded or rewritten:
+
+```go
+plan, err := source.PlanCopy(ctx)
+if err != nil {
+    return err
+}
+
+report, err := source.CopyTo(ctx, destination, plan)
+if err != nil {
+    return err
+}
+fmt.Printf("copied %d, already present %d, verified %d\n",
+    len(report.Copied), len(report.Existing), len(report.Verified))
+```
+
+`PlanCopy` pins every source tag and its current digest, so `CopyTo` copies exactly that snapshot. `CopyTo` copies each tagged graph, re-resolves every destination tag, walks its graph again, and re-checks both tag inventories before reporting success.
+
+What the copy does and does not do:
+
+- It copies tagged OCI graphs only. Untagged package versions and referrers are not discovered or copied.
+- It skips validated `locked-*` and `unlocked-*` markers: locks are process state, not state content. A live lock refuses the plan and the copy.
+- It refuses a destination that contains a tag outside the plan, or a planned tag pointing at a different digest.
+- It never deletes from the source. It refuses to overwrite a destination tag it detects, but that check is best-effort, not compare-and-swap.
+- It is not compare-and-swap. Stop all writers while planning and copying; a write can still race the final inventory.
+- It is resumable: a re-run skips tags that already point at the planned digest with a complete graph, and copies the rest.
+
+The usual migration is: drain writers, copy and verify, repoint consumers at the new package, then retire the source package separately. Nothing is published to the source, and no OCI tag is deleted. The whole copy runs under the caller's context; pass a deadline if you want one.
+
 ## Concurrency model
 
 OCI mutable tags are last-writer-wins and do not provide compare-and-swap semantics.
