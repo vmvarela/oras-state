@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"reflect"
 	"slices"
 	"strings"
@@ -114,10 +113,9 @@ func (c *Client) PlanCopy(ctx context.Context) (*CopyPlan, error) {
 	if c == nil || c.repoClient == nil || c.repoClient.inner == nil {
 		return nil, errors.New("copy source client is not configured")
 	}
-	ctx, cancel := c.opContext(ctx)
-	defer cancel()
-
-	tags, err := c.listCopyTags(ctx)
+	// Caller-bounded: a package with many tags outlives the per-operation
+	// default deadline.
+	tags, err := c.listCopyTags(ctx, false)
 	if err != nil {
 		return nil, err
 	}
@@ -260,12 +258,11 @@ func (c *Client) CopyTo(ctx context.Context, dst *Client, plan *CopyPlan) (*Copy
 	if err := validateCopyTargets(c, dst, plan); err != nil {
 		return nil, err
 	}
-	ctx, cancel := c.opContext(ctx)
-	defer cancel()
 
-	// The source must still match the plan before any write. This also catches
-	// a lock acquired after PlanCopy.
-	current, err := c.inventoryCopyTags(ctx)
+	// The source must still match the plan before any write, which also catches
+	// a lock acquired after PlanCopy. Bulk copy uses the caller's context: the
+	// single-operation default deadline would abort large migrations.
+	current, err := c.inventoryCopyTags(ctx, false)
 	if err != nil {
 		return nil, fmt.Errorf("inspecting copy source: %w", err)
 	}
@@ -273,7 +270,7 @@ func (c *Client) CopyTo(ctx context.Context, dst *Client, plan *CopyPlan) (*Copy
 		return nil, err
 	}
 
-	dstTags, err := dst.inventoryCopyTags(ctx)
+	dstTags, err := dst.inventoryCopyTags(ctx, true)
 	if err != nil {
 		return nil, fmt.Errorf("inspecting copy destination: %w", err)
 	}
@@ -299,14 +296,12 @@ func (c *Client) CopyTo(ctx context.Context, dst *Client, plan *CopyPlan) (*Copy
 	}
 
 	report := &CopyReport{}
-	srcStorage := copyStorage{c.repoClient.inner}
-	dstStorage := copyStorage{dst.repoClient.inner}
 	for _, artifact := range plan.Artifacts {
 		if _, ok := dstTags[artifact.Tag]; ok {
 			report.Existing = append(report.Existing, artifact)
 			continue
 		}
-		if err := oras.CopyGraph(ctx, srcStorage, dstStorage, artifact.Descriptor, oras.CopyGraphOptions{}); err != nil {
+		if err := oras.CopyGraph(ctx, c.repoClient.inner, dst.repoClient.inner, artifact.Descriptor, oras.CopyGraphOptions{}); err != nil {
 			return report, fmt.Errorf("copying tag %q (%s): %w", artifact.Tag, artifact.Descriptor.Digest, err)
 		}
 		// Re-resolve immediately before tagging so we never knowingly
@@ -324,7 +319,7 @@ func (c *Client) CopyTo(ctx context.Context, dst *Client, plan *CopyPlan) (*Copy
 		case !isNotFound(err):
 			return report, fmt.Errorf("checking destination tag %q before writing: %w", artifact.Tag, err)
 		}
-		if err := dst.repoClient.inner.Tag(ctx, artifact.Descriptor, artifact.Tag); err != nil {
+		if err := tagPrePushNotFoundRetry(ctx, dst.repoClient.inner, artifact.Descriptor, artifact.Tag); err != nil {
 			return report, fmt.Errorf("tagging destination %q with %s: %w", artifact.Tag, artifact.Descriptor.Digest, err)
 		}
 		report.Copied = append(report.Copied, artifact)
@@ -350,7 +345,7 @@ func (c *Client) CopyTo(ctx context.Context, dst *Client, plan *CopyPlan) (*Copy
 	// appeared or moved after the initial preflight. Skipped tombstones are not
 	// expected in the destination, so their presence is refused. This is still
 	// not CAS: a change after this inventory is undetected.
-	finalDst, err := dst.inventoryCopyTags(ctx)
+	finalDst, err := dst.inventoryCopyTags(ctx, false)
 	if err != nil {
 		return report, fmt.Errorf("re-inspecting copy destination: %w", err)
 	}
@@ -358,7 +353,7 @@ func (c *Client) CopyTo(ctx context.Context, dst *Client, plan *CopyPlan) (*Copy
 		return report, err
 	}
 
-	final, err := c.inventoryCopyTags(ctx)
+	final, err := c.inventoryCopyTags(ctx, false)
 	if err != nil {
 		return report, fmt.Errorf("re-inspecting copy source: %w", err)
 	}
@@ -458,9 +453,10 @@ func (p *CopyPlan) expectedDigests() map[string]digest.Digest {
 }
 
 // listCopyTags lists every tag in the repository, sorted and deduplicated.
-// A missing repository is an empty tag list, matching the rest of the package;
-// permission and transport errors are propagated.
-func (c *Client) listCopyTags(ctx context.Context) ([]string, error) {
+// A missing repository is an empty tag list only when allowMissing is set: the
+// destination may not exist yet, but a missing source must not silently plan a
+// zero-artifact copy. Permission and transport errors are propagated.
+func (c *Client) listCopyTags(ctx context.Context, allowMissing bool) ([]string, error) {
 	var tags []string
 	err := retry(ctx, func(ctx context.Context) error {
 		tags = nil
@@ -470,7 +466,10 @@ func (c *Client) listCopyTags(ctx context.Context) ([]string, error) {
 		})
 	})
 	if isNotFound(err) {
-		return nil, nil
+		if allowMissing {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("repository %q not found (check the configured repository): %w", c.repoClient.repository, err)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("listing repository tags: %w", err)
@@ -484,8 +483,8 @@ func (c *Client) listCopyTags(ctx context.Context) ([]string, error) {
 // instead of treating it as absent. A tag whose content is missing still
 // resolves and is pinned (graph verification will fail if its content is
 // needed).
-func (c *Client) inventoryCopyTags(ctx context.Context) (map[string]ocispec.Descriptor, error) {
-	tags, err := c.listCopyTags(ctx)
+func (c *Client) inventoryCopyTags(ctx context.Context, allowMissing bool) (map[string]ocispec.Descriptor, error) {
+	tags, err := c.listCopyTags(ctx, allowMissing)
 	if err != nil {
 		return nil, err
 	}
@@ -579,7 +578,6 @@ func descriptorsEqual(a, b ocispec.Descriptor) bool {
 // content.Successors) but does not re-hash blob bytes: the registry CAS is
 // trusted for content integrity, as elsewhere in this package.
 func verifyCopyGraph(ctx context.Context, repo orasRepository, root ocispec.Descriptor) error {
-	storage := copyStorage{repo}
 	seen := make(map[digest.Digest]struct{})
 	var walk func(ocispec.Descriptor) error
 	walk = func(desc ocispec.Descriptor) error {
@@ -591,7 +589,7 @@ func verifyCopyGraph(ctx context.Context, repo orasRepository, root ocispec.Desc
 		}
 		seen[desc.Digest] = struct{}{}
 
-		exists, err := storage.Exists(ctx, desc)
+		exists, err := repo.Exists(ctx, desc)
 		if err != nil {
 			return fmt.Errorf("checking %s: %w", desc.Digest, err)
 		}
@@ -599,7 +597,7 @@ func verifyCopyGraph(ctx context.Context, repo orasRepository, root ocispec.Desc
 			return fmt.Errorf("missing content %s", desc.Digest)
 		}
 
-		successors, err := content.Successors(ctx, storage, desc)
+		successors, err := content.Successors(ctx, repo, desc)
 		if err != nil {
 			return fmt.Errorf("reading successors of %s: %w", desc.Digest, err)
 		}
@@ -631,12 +629,7 @@ type copyManifestData struct {
 // copyManifestFromDescriptor reads and decodes an already-pinned manifest. It
 // never re-resolves a tag, so classification follows the snapshot descriptor.
 func copyManifestFromDescriptor(ctx context.Context, repo orasRepository, desc ocispec.Descriptor) (copyManifestData, error) {
-	rc, err := repo.Fetch(ctx, desc)
-	if err != nil {
-		return copyManifestData{}, err
-	}
-	defer func() { _ = rc.Close() }()
-	data, err := io.ReadAll(io.LimitReader(rc, maxManifestSize))
+	data, err := fetchManifestBytes(ctx, repo, desc)
 	if err != nil {
 		return copyManifestData{}, err
 	}
@@ -779,38 +772,4 @@ func artifactKind(kind copyTagKind) ArtifactKind {
 	default:
 		return ArtifactKindUnknown
 	}
-}
-
-// copyStorage adapts the package's minimal orasRepository to ORAS
-// content.Storage. Existence is delegated to the repository when it supports
-// it; otherwise it is answered by resolving the digest, which is the same CAS
-// check at the registry.
-type copyStorage struct {
-	repo orasRepository
-}
-
-func (s copyStorage) Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
-	return s.repo.Push(ctx, expected, content)
-}
-
-func (s copyStorage) Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error) {
-	return s.repo.Fetch(ctx, target)
-}
-
-func (s copyStorage) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
-	if exister, ok := s.repo.(interface {
-		Exists(context.Context, ocispec.Descriptor) (bool, error)
-	}); ok {
-		return exister.Exists(ctx, target)
-	}
-	_, err := retryWithResult(ctx, func(ctx context.Context) (ocispec.Descriptor, error) {
-		return s.repo.Resolve(ctx, target.Digest.String())
-	})
-	if err != nil {
-		if isNotFound(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
 }

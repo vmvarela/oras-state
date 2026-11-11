@@ -69,6 +69,10 @@ func (r *delegatingRepo) Fetch(ctx context.Context, target ocispec.Descriptor) (
 	return r.inner.Fetch(ctx, target)
 }
 
+func (r *delegatingRepo) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
+	return r.inner.Exists(ctx, target)
+}
+
 func (r *delegatingRepo) Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error) {
 	return r.inner.Resolve(ctx, reference)
 }

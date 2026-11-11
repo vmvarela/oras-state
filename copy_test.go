@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
@@ -588,7 +590,7 @@ func (r *tagsErrorRepo) Tags(context.Context, string, func([]string) error) erro
 	return r.err
 }
 
-func TestCopyPlan_MissingRepositoryIsEmptyAndPermissionFails(t *testing.T) {
+func TestCopyPlan_MissingRepositoryAndPermissionFail(t *testing.T) {
 	ctx := context.Background()
 
 	missing := &Client{
@@ -599,12 +601,8 @@ func TestCopyPlan_MissingRepositoryIsEmptyAndPermissionFails(t *testing.T) {
 		config:       Config{},
 		retentionSem: make(chan struct{}, 3),
 	}
-	plan, err := missing.PlanCopy(ctx)
-	if err != nil {
-		t.Fatalf("PlanCopy on a missing repository: %v", err)
-	}
-	if plan == nil || len(plan.Artifacts) != 0 {
-		t.Fatalf("plan = %+v, want an empty plan", plan)
+	if _, err := missing.PlanCopy(ctx); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("PlanCopy on a missing repository = %v, want a not-found error", err)
 	}
 
 	denied := &Client{
@@ -620,6 +618,128 @@ func TestCopyPlan_MissingRepositoryIsEmptyAndPermissionFails(t *testing.T) {
 	}
 	if _, err := denied.PlanCopy(ctx); err == nil {
 		t.Fatal("PlanCopy with a permission error must fail")
+	}
+}
+
+// appearingRepo reports the repository as missing until the first push, like a
+// destination package that does not exist yet.
+type appearingRepo struct {
+	delegatingRepo
+	missing atomic.Bool
+}
+
+func (r *appearingRepo) Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
+	r.missing.Store(false)
+	return r.inner.Push(ctx, expected, content)
+}
+
+func (r *appearingRepo) Tags(ctx context.Context, last string, fn func(tags []string) error) error {
+	if r.missing.Load() {
+		return errdef.ErrNotFound
+	}
+	return r.inner.Tags(ctx, last, fn)
+}
+
+func TestCopyTo_MissingDestinationRepositoryIsEmpty(t *testing.T) {
+	ctx := context.Background()
+	src, srcRepo := newCopyClient(t, "example/src", WorkspaceLayoutHashed)
+	addCopyArtifact(t, srcRepo, stateTagPrefix+workspaceTagFor("default"), map[string]string{annotationWorkspace: "default"})
+	plan, err := src.PlanCopy(ctx)
+	if err != nil {
+		t.Fatalf("PlanCopy: %v", err)
+	}
+
+	repo := &appearingRepo{delegatingRepo: delegatingRepo{inner: newFakeORASRepo()}}
+	repo.missing.Store(true)
+	dst := &Client{
+		repoClient:   &orasRepositoryClient{repository: "example/dst", inner: repo},
+		retentionSem: make(chan struct{}, 3),
+	}
+	report, err := src.CopyTo(ctx, dst, plan)
+	if err != nil {
+		t.Fatalf("CopyTo into a missing destination: %v", err)
+	}
+	if len(report.Copied) != 1 {
+		t.Fatalf("copied = %d artifacts, want 1", len(report.Copied))
+	}
+}
+
+// notFoundOnceTagRepo returns errdef.ErrNotFound from the first Tag call: the
+// pre-push digest GET 404 that GHCR produces intermittently.
+type notFoundOnceTagRepo struct {
+	delegatingRepo
+	mu    sync.Mutex
+	calls int
+}
+
+func (r *notFoundOnceTagRepo) Tag(ctx context.Context, desc ocispec.Descriptor, reference string) error {
+	r.mu.Lock()
+	r.calls++
+	first := r.calls == 1
+	r.mu.Unlock()
+	if first {
+		return errdef.ErrNotFound
+	}
+	return r.inner.Tag(ctx, desc, reference)
+}
+
+func TestCopyTo_RetriesPrePushTagNotFound(t *testing.T) {
+	ctx := context.Background()
+	src, srcRepo := newCopyClient(t, "example/src", WorkspaceLayoutHashed)
+	addCopyArtifact(t, srcRepo, stateTagPrefix+workspaceTagFor("default"), map[string]string{annotationWorkspace: "default"})
+	plan, err := src.PlanCopy(ctx)
+	if err != nil {
+		t.Fatalf("PlanCopy: %v", err)
+	}
+
+	repo := &notFoundOnceTagRepo{delegatingRepo: delegatingRepo{inner: newFakeORASRepo()}}
+	dst := &Client{
+		repoClient:   &orasRepositoryClient{repository: "example/dst", inner: repo},
+		retentionSem: make(chan struct{}, 3),
+	}
+	report, err := src.CopyTo(ctx, dst, plan)
+	if err != nil {
+		t.Fatalf("CopyTo: %v", err)
+	}
+	if len(report.Copied) != 1 {
+		t.Fatalf("copied = %d artifacts, want 1", len(report.Copied))
+	}
+	if repo.calls != 2 {
+		t.Fatalf("Tag calls = %d, want 2 (pre-push 404, then success)", repo.calls)
+	}
+}
+
+// deadlineRepo records whether each tag listing saw a context deadline.
+type deadlineRepo struct {
+	delegatingRepo
+	mu        sync.Mutex
+	deadlines []bool
+}
+
+func (r *deadlineRepo) Tags(ctx context.Context, last string, fn func(tags []string) error) error {
+	_, has := ctx.Deadline()
+	r.mu.Lock()
+	r.deadlines = append(r.deadlines, has)
+	r.mu.Unlock()
+	return r.inner.Tags(ctx, last, fn)
+}
+
+func TestPlanCopy_DoesNotInjectDeadline(t *testing.T) {
+	repo := &deadlineRepo{delegatingRepo: delegatingRepo{inner: newFakeORASRepo()}}
+	c := &Client{
+		repoClient:   &orasRepositoryClient{repository: "example/src", inner: repo},
+		retentionSem: make(chan struct{}, 3),
+	}
+	if _, err := c.PlanCopy(context.Background()); err != nil {
+		t.Fatalf("PlanCopy: %v", err)
+	}
+	if len(repo.deadlines) == 0 {
+		t.Fatal("PlanCopy listed no tags")
+	}
+	for i, has := range repo.deadlines {
+		if has {
+			t.Fatalf("tag listing %d saw a deadline the caller did not set", i)
+		}
 	}
 }
 

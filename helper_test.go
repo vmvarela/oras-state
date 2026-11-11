@@ -69,6 +69,15 @@ func (r *fakeORASRepo) Fetch(ctx context.Context, target ocispec.Descriptor) (io
 	return io.NopCloser(bytes.NewReader(b)), nil
 }
 
+func (r *fakeORASRepo) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
+	_ = ctx
+
+	r.mu.Lock()
+	_, ok := r.blobs[target.Digest]
+	r.mu.Unlock()
+	return ok, nil
+}
+
 func (r *fakeORASRepo) Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error) {
 	_ = ctx
 

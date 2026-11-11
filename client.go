@@ -1932,18 +1932,24 @@ func (wc *workspaceClient) fetchManifestInternal(ctx context.Context, reference 
 	return m, desc, nil
 }
 
+// fetchManifestBytes reads a manifest by an ALREADY-RESOLVED descriptor with
+// the package's bounded read. It never resolves a tag.
+func fetchManifestBytes(ctx context.Context, repo orasRepository, desc ocispec.Descriptor) ([]byte, error) {
+	rc, err := repo.Fetch(ctx, desc)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }()
+
+	return io.ReadAll(io.LimitReader(rc, maxManifestSize))
+}
+
 // fetchManifestByDesc fetches and parses the manifest identified by an
 // ALREADY-RESOLVED descriptor — it never resolves a mutable tag, so callers
 // validating a digest group get exactly the grouped bytes. It applies the
 // same bounded read, decoding, and workspace validation as the by-tag path.
 func (wc *workspaceClient) fetchManifestByDesc(ctx context.Context, desc ocispec.Descriptor) (ocispec.Manifest, error) {
-	rc, err := wc.client.repoClient.inner.Fetch(ctx, desc)
-	if err != nil {
-		return ocispec.Manifest{}, err
-	}
-	defer func() { _ = rc.Close() }()
-
-	data, err := io.ReadAll(io.LimitReader(rc, maxManifestSize))
+	data, err := fetchManifestBytes(ctx, wc.client.repoClient.inner, desc)
 	if err != nil {
 		return ocispec.Manifest{}, err
 	}
