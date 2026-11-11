@@ -120,7 +120,7 @@ func (c *Client) Purge(ctx context.Context, opts PurgeOptions) (PurgeReport, err
 	if err != nil {
 		return report, err
 	}
-	live := make(map[string]bool, len(tags))
+	live := make(map[string]int, len(tags))
 	for _, tag := range tags {
 		desc, err := resolveCopyTag(ctx, c.repoClient.inner, tag)
 		if err != nil {
@@ -129,11 +129,13 @@ func (c *Client) Purge(ctx context.Context, opts PurgeOptions) (PurgeReport, err
 			}
 			return report, err
 		}
-		live[desc.Digest.String()] = true
+		live[desc.Digest.String()]++
 	}
 
 	for _, cand := range candidates {
-		if live[cand.Digest] {
+		// A candidate's own tags are expected to resolve to its digest. Only a
+		// reference held by some other tag means the digest is still in use.
+		if live[cand.Digest] > len(cand.Tags) {
 			report.Skipped = append(report.Skipped, fmt.Sprintf("%s: digest is referenced by a live tag", cand.Digest))
 			continue
 		}
