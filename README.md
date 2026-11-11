@@ -153,6 +153,32 @@ What the copy does and does not do:
 
 The usual migration is: drain writers, copy and verify, repoint consumers at the new package, then retire the source package separately. Nothing is published to the source, and no OCI tag is deleted. The whole copy runs under the caller's context; pass a deadline if you want one.
 
+## Purging unused GHCR package versions
+
+On `ghcr.io`, `MaxVersions` cannot delete anything (the registry rejects manifest `DELETE`), so every `Put`, `Lock` and `Unlock` leaves the previous version behind with no tags. `Purge` removes that garbage in place, without copying the repository:
+
+```go
+report, err := client.Purge(ctx, orasstate.PurgeOptions{Apply: false})
+if err != nil {
+    return err
+}
+for _, c := range report.Candidates {
+    fmt.Println(c.Reason, c.VersionID, c.Digest, c.Tags)
+}
+```
+
+Dry run is the default: with `Apply: false` it only reports. It selects two kinds of candidate:
+
+- versions with no tags at all, older than `GracePeriod` (default 10 minutes), and
+- history versions beyond `KeepPerWorkspace` (default `Config.MaxVersions`) per workspace.
+
+What it does and does not do:
+
+- It refuses to run on anything but `ghcr.io`, and needs a token with `delete:packages` plus admin on the package. A normal `plan`/`apply` token is not enough, which is why this is an explicit operation and never automatic.
+- It always keeps at least one tagged version: GHCR refuses to delete the last one, so a package cannot be emptied this way.
+- It refuses while any `locked-*` tag holds a live lock. That check is cooperative, like every other lock in this library: it detects a writer, it cannot fence one. Drain writers before applying.
+- It re-reads the live tag set immediately before deleting, skips any candidate whose digest is still referenced, and verifies every surviving `state-*`, `wsmeta-*` and `stver-*` manifest afterwards.
+
 ## Concurrency model
 
 OCI mutable tags are last-writer-wins and do not provide compare-and-swap semantics.

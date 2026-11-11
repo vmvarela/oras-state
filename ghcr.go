@@ -41,9 +41,10 @@ const (
 var ghcrDeleteRetryDelay = 500 * time.Millisecond
 
 type githubPackageVersion struct {
-	ID       int64  `json:"id"`
-	Name     string `json:"name"` // full digest of the manifest, e.g. "sha256:..."
-	Metadata struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"` // full digest of the manifest, e.g. "sha256:..."
+	UpdatedAt time.Time `json:"updated_at"`
+	Metadata  struct {
 		Container struct {
 			Tags []string `json:"tags"`
 		} `json:"container"`
