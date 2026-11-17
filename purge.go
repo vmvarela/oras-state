@@ -219,6 +219,9 @@ func purgeCandidates(versions []githubPackageVersion, keep int, grace time.Durat
 		excess = map[string]bool{}
 		for base, numbers := range byBase {
 			slices.Sort(numbers)
+			// GHCR metadata repeats tags after a retag, so count unique version
+			// numbers: a duplicate must not push an extra version past keep.
+			numbers = slices.Compact(numbers)
 			for _, n := range numbers[:max(0, len(numbers)-keep)] {
 				excess[base+stateVersionTagSeparator+strconv.Itoa(n)] = true
 			}
