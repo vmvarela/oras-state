@@ -120,7 +120,7 @@ func (c *Client) Purge(ctx context.Context, opts PurgeOptions) (PurgeReport, err
 	if err != nil {
 		return report, err
 	}
-	live := make(map[string]bool, len(tags))
+	live := make(map[string][]string, len(tags))
 	for _, tag := range tags {
 		desc, err := resolveCopyTag(ctx, c.repoClient.inner, tag)
 		if err != nil {
@@ -129,11 +129,19 @@ func (c *Client) Purge(ctx context.Context, opts PurgeOptions) (PurgeReport, err
 			}
 			return report, err
 		}
-		live[desc.Digest.String()] = true
+		digest := desc.Digest.String()
+		live[digest] = append(live[digest], tag)
 	}
 
 	for _, cand := range candidates {
-		if live[cand.Digest] {
+		foreignReference := false
+		for _, tag := range live[cand.Digest] {
+			if !slices.Contains(cand.Tags, tag) {
+				foreignReference = true
+				break
+			}
+		}
+		if foreignReference {
 			report.Skipped = append(report.Skipped, fmt.Sprintf("%s: digest is referenced by a live tag", cand.Digest))
 			continue
 		}
@@ -211,6 +219,9 @@ func purgeCandidates(versions []githubPackageVersion, keep int, grace time.Durat
 		excess = map[string]bool{}
 		for base, numbers := range byBase {
 			slices.Sort(numbers)
+			// GHCR metadata repeats tags after a retag, so count unique version
+			// numbers: a duplicate must not push an extra version past keep.
+			numbers = slices.Compact(numbers)
 			for _, n := range numbers[:max(0, len(numbers)-keep)] {
 				excess[base+stateVersionTagSeparator+strconv.Itoa(n)] = true
 			}

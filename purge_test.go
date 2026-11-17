@@ -18,7 +18,11 @@ import (
 func seedManifest(t *testing.T, repo *fakeORASRepo, tag string) ocispec.Descriptor {
 	t.Helper()
 	ctx := context.Background()
-	desc, err := oras.PackManifest(ctx, repo, oras.PackManifestVersion1_1, "application/vnd.test.state", oras.PackManifestOptions{})
+	// The tag goes into the manifest so each seeded tag has its own digest,
+	// like real state, marker and history artifacts do.
+	desc, err := oras.PackManifest(ctx, repo, oras.PackManifestVersion1_1, "application/vnd.test.state", oras.PackManifestOptions{
+		ManifestAnnotations: map[string]string{"test.tag": tag},
+	})
 	if err != nil {
 		t.Fatalf("pack manifest: %v", err)
 	}
@@ -219,4 +223,144 @@ func testWorkspaceTag(t *testing.T, workspace string) string {
 	t.Helper()
 	c := &Client{}
 	return c.workspaceTagFor(workspace)
+}
+
+func TestPurge_ApplyDeletesExcessHistoryWithLiveTags(t *testing.T) {
+	repo := newFakeORASRepo()
+	id := testWorkspaceTag(t, "default")
+	seedManifest(t, repo, "state-"+id)
+	seedManifest(t, repo, "wsmeta-"+id)
+
+	var versions []githubPackageVersion
+	for i := 1; i <= 4; i++ {
+		tag := fmt.Sprintf("stver-%s-v%d", id, i)
+		desc := seedManifest(t, repo, tag)
+		if i == 1 {
+			if err := repo.Tag(context.Background(), desc, "alias-"+id); err != nil {
+				t.Fatalf("tag alias: %v", err)
+			}
+		}
+		versions = append(versions, purgeVersion(int64(i), desc.Digest.String(), []string{tag}, time.Hour))
+	}
+
+	var deleted []string
+	c := newPurgeClient(t, repo, 2, func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodDelete {
+			deleted = append(deleted, r.URL.Path)
+			return fakeGitHubResponse(http.StatusNoContent, ""), nil
+		}
+		return fakeGitHubResponse(http.StatusOK, purgeVersionsBody(versions)), nil
+	})
+
+	report, err := c.Purge(context.Background(), PurgeOptions{Apply: true})
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+
+	// A candidate's own history tag must not stop deletion, but an alias must.
+	if len(deleted) != 1 || !strings.HasSuffix(deleted[0], "/versions/2") {
+		t.Fatalf("deleted paths = %v, want only version 2", deleted)
+	}
+	if len(report.Deleted) != 1 || report.Deleted[0].VersionID != 2 {
+		t.Errorf("report.Deleted = %+v, want version 2", report.Deleted)
+	}
+	if len(report.Skipped) != 1 || !strings.Contains(report.Skipped[0], versions[0].Name) {
+		t.Errorf("Skipped = %v, want the aliased version 1 digest", report.Skipped)
+	}
+}
+
+// TestPurge_RepeatedVersionMetadataDoesNotInflateExcess covers GHCR metadata
+// that repeats a version tag (documented after a retag). The excess cut must
+// count unique version numbers: with keep=2 over v1..v3, a duplicated v3 tag
+// must not turn v1 and v2 into excess and leave a single real version.
+func TestPurge_RepeatedVersionMetadataDoesNotInflateExcess(t *testing.T) {
+	repo := newFakeORASRepo()
+	id := testWorkspaceTag(t, "default")
+	seedManifest(t, repo, "state-"+id)
+	seedManifest(t, repo, "wsmeta-"+id)
+
+	var versions []githubPackageVersion
+	for i := 1; i <= 3; i++ {
+		tag := fmt.Sprintf("stver-%s-v%d", id, i)
+		desc := seedManifest(t, repo, tag)
+		tags := []string{tag}
+		if i == 3 {
+			tags = append(tags, tag) // duplicate alias in the metadata
+		}
+		versions = append(versions, purgeVersion(int64(i), desc.Digest.String(), tags, time.Hour))
+	}
+
+	var deleted []string
+	c := newPurgeClient(t, repo, 2, func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodDelete {
+			deleted = append(deleted, r.URL.Path)
+			return fakeGitHubResponse(http.StatusNoContent, ""), nil
+		}
+		return fakeGitHubResponse(http.StatusOK, purgeVersionsBody(versions)), nil
+	})
+
+	report, err := c.Purge(context.Background(), PurgeOptions{Apply: true})
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+
+	if len(report.Candidates) != 1 || report.Candidates[0].VersionID != 1 {
+		t.Errorf("Candidates = %+v, want only version 1 beyond keep=2", report.Candidates)
+	}
+	if len(deleted) != 1 || !strings.HasSuffix(deleted[0], "/versions/1") {
+		t.Fatalf("deleted paths = %v, want only version 1", deleted)
+	}
+	if len(report.Deleted) != 1 || report.Deleted[0].VersionID != 1 {
+		t.Errorf("report.Deleted = %+v, want version 1", report.Deleted)
+	}
+}
+
+// TestPurge_SkipsCandidateReferencedOnlyByForeignLiveTag covers stale GHCR
+// metadata: the candidate still lists stver-v1, but the live inventory holds
+// only an alias on its digest because the original tag moved elsewhere.
+// Counting live tags would delete it; comparing tag identities must skip it
+// and still delete v2, which only carries its own tag.
+func TestPurge_SkipsCandidateReferencedOnlyByForeignLiveTag(t *testing.T) {
+	repo := newFakeORASRepo()
+	id := testWorkspaceTag(t, "default")
+	seedManifest(t, repo, "state-"+id)
+	seedManifest(t, repo, "wsmeta-"+id)
+
+	// The candidate digest keeps only a foreign alias in the live repository;
+	// the original stver-v1 tag has moved onto a different manifest.
+	aliased := seedManifest(t, repo, "alias-"+id)
+	seedManifest(t, repo, fmt.Sprintf("stver-%s-v1", id))
+	v2 := seedManifest(t, repo, fmt.Sprintf("stver-%s-v2", id))
+	v3 := seedManifest(t, repo, fmt.Sprintf("stver-%s-v3", id))
+
+	versions := []githubPackageVersion{
+		// Version 1 metadata still claims stver-v1 for the old digest.
+		purgeVersion(1, aliased.Digest.String(), []string{fmt.Sprintf("stver-%s-v1", id)}, time.Hour),
+		purgeVersion(2, v2.Digest.String(), []string{fmt.Sprintf("stver-%s-v2", id)}, time.Hour),
+		purgeVersion(3, v3.Digest.String(), []string{fmt.Sprintf("stver-%s-v3", id)}, time.Hour),
+	}
+
+	var deleted []string
+	c := newPurgeClient(t, repo, 1, func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodDelete {
+			deleted = append(deleted, r.URL.Path)
+			return fakeGitHubResponse(http.StatusNoContent, ""), nil
+		}
+		return fakeGitHubResponse(http.StatusOK, purgeVersionsBody(versions)), nil
+	})
+
+	report, err := c.Purge(context.Background(), PurgeOptions{Apply: true})
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+
+	if len(report.Skipped) != 1 || !strings.Contains(report.Skipped[0], aliased.Digest.String()) {
+		t.Errorf("Skipped = %v, want the aliased version 1 digest", report.Skipped)
+	}
+	if len(deleted) != 1 || !strings.HasSuffix(deleted[0], "/versions/2") {
+		t.Fatalf("deleted paths = %v, want only version 2", deleted)
+	}
+	if len(report.Deleted) != 1 || report.Deleted[0].VersionID != 2 {
+		t.Errorf("report.Deleted = %+v, want version 2", report.Deleted)
+	}
 }
