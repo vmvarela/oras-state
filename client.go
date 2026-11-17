@@ -1388,6 +1388,73 @@ func (c *Client) List(ctx context.Context) ([]string, error) {
 	return listWorkspacesFromTags(ctx, c.repoClient)
 }
 
+// WorkspaceExists reports whether the named workspace exists, probing only
+// that workspace's own tags instead of enumerating the repository like List.
+// The answer matches List's membership for the name: the hashed layout
+// requires a verifiable current-state tag or workspace marker; the legacy
+// layout decides from the workspace's literal or hashed state tag, and a tag
+// that proves another workspace's retained history (state-foo-v1 while it is
+// history of foo) does not make that name exist.
+//
+// One documented discrepancy: listLegacyWorkspaces validates at most
+// legacyVersionWorkspaceValidationLimitPerBase version-shaped tags per base
+// and omits the middle candidates beyond that bound, so List can drop an
+// exact literal workspace (state-foo-v9 among more than 16 candidates) while
+// this lookup still answers for it. Reproducing that bound would need the
+// enumeration this API exists to avoid, and the bound is a listing read
+// limit, not an ownership rule.
+//
+// This is neither CAS nor repository-wide validation: tags can move after the
+// probe, and List/state operations still reject a mixed-layout repository
+// that this probe never inventories.
+func (c *Client) WorkspaceExists(ctx context.Context, stateID string) (bool, error) {
+	ctx, cancel := c.opContext(ctx)
+	defer cancel()
+	if c.config.WorkspaceLayout == WorkspaceLayoutLegacy {
+		exists, err := legacyWorkspaceExists(ctx, c.repoClient, stateID)
+		if err != nil || exists || stateID != "default" {
+			return exists, err
+		}
+		// The listing reports the implicit "default" of a repository with no
+		// state; only the listing can prove that absence, so a negative
+		// probe of "default" falls back to it.
+		names, err := listLegacyWorkspaces(ctx, c.repoClient)
+		if err != nil {
+			return false, err
+		}
+		return slices.Contains(names, "default"), nil
+	}
+	return c.hashedWorkspaceExists(ctx, stateID)
+}
+
+// hashedWorkspaceExists probes this workspace's own state tag first and its
+// workspace marker second, applying the same identity rules List uses for the
+// tags it discovers.
+func (c *Client) hashedWorkspaceExists(ctx context.Context, stateID string) (bool, error) {
+	wc := newWorkspaceClient(c, stateID)
+	name, _, err := workspaceIdentityFromTag(ctx, c.repoClient, wc.stateTag)
+	switch {
+	case err == nil:
+		return name == stateID, nil
+	case isNotFound(err) && !isMissingContent(err):
+		// No current state: the marker alone still witnesses the workspace.
+	default:
+		return false, err
+	}
+	m, _, err := resolveAndFetchManifest(ctx, c.repoClient.inner, wc.markerTag)
+	switch {
+	case err == nil:
+		if err := validateWorkspaceMarker(m, wc.markerTag, stateID); err != nil {
+			return false, err
+		}
+		return true, nil
+	case isNotFound(err) && !isMissingContent(err):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 // Close waits for all in-flight background retention work to finish.
 // It is safe to call multiple times. Consumers should prefer Close over
 // depending on retention implementation details.

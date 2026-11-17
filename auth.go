@@ -202,6 +202,13 @@ func NewClient(registry, repository string, cfg Config) (*Client, error) {
 	}, nil
 }
 
+// tagListPageSize is the ORAS tag-list page size requested by this library.
+// Zero would leave the page size to each registry's default; a fixed large
+// page bounds the round-trips of the paths that still enumerate every tag
+// (List, preflight, copy, purge) as retained history grows. Registries may
+// return fewer items per page and continue with a Link header.
+const tagListPageSize = 1000
+
 // newORASRepositoryClient creates the underlying ORAS repository client with
 // the given configuration.
 func newORASRepositoryClient(registry, repository string, cfg Config) (*orasRepositoryClient, error) {
@@ -215,6 +222,7 @@ func newORASRepositoryClient(registry, repository string, cfg Config) (*orasRepo
 	if err != nil {
 		return nil, fmt.Errorf("failed to create remote repository: %w", err)
 	}
+	repo.TagListPageSize = tagListPageSize
 
 	if cfg.PlainHTTP {
 		repo.Registry.PlainHTTP = true

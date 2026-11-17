@@ -62,6 +62,65 @@ func (wc *workspaceClient) checkLegacyWorkspace(ctx context.Context) (workspaceO
 	return obs, nil
 }
 
+// legacyWorkspaceExists probes the one state tag that would hold stateID's
+// state, mirroring listLegacyWorkspaces' membership rules without enumerating
+// tags: literal names come from the tag name itself, ws- hashed names from the
+// pinned manifest's workspace annotation, and a version-shaped tag only counts
+// when it is not another workspace's retained history. It deliberately does
+// not reproduce the listing's bounded validation window for version-shaped
+// tags (see WorkspaceExists).
+func legacyWorkspaceExists(ctx context.Context, repo *orasRepositoryClient, stateID string) (bool, error) {
+	probe := stateTagPrefix + legacyWorkspaceTagFor(stateID)
+	var exists bool
+	err := retry(ctx, func(ctx context.Context) error {
+		var err error
+		exists, err = legacyWorkspaceExistsOnce(ctx, repo, probe, stateID)
+		return err
+	})
+	return exists, err
+}
+
+func legacyWorkspaceExistsOnce(ctx context.Context, repo *orasRepositoryClient, probe, stateID string) (bool, error) {
+	if _, err := repo.inner.Resolve(ctx, probe); err != nil {
+		if isNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	suffix := strings.TrimPrefix(probe, stateTagPrefix)
+	needManifest := strings.HasPrefix(suffix, "ws-")
+	base, version := "", 0
+	if b, v, ok := splitLegacyStateVersionTag(probe); ok {
+		// Ambiguity: state-foo-v1 is either workspace foo's retained history
+		// or the literal state of workspace foo-v1; the history reading only
+		// applies while the base tag exists, exactly as the listing decides.
+		if _, err := repo.inner.Resolve(ctx, b); err == nil {
+			needManifest = true
+			base, version = b, v
+		} else if !isNotFound(err) {
+			return false, err
+		}
+	}
+	if !needManifest {
+		return true, nil
+	}
+	m, _, err := resolveAndFetchManifest(ctx, repo.inner, probe)
+	if err != nil {
+		return false, err
+	}
+	if base != "" && legacyStateVersionManifestMatches(m, base, version) {
+		return false, nil
+	}
+	if strings.HasPrefix(suffix, "ws-") {
+		name := m.Annotations[annotationWorkspace]
+		if name == "" {
+			name = suffix
+		}
+		return name == stateID, nil
+	}
+	return true, nil
+}
+
 func listLegacyWorkspaces(ctx context.Context, repo *orasRepositoryClient) ([]string, error) {
 	tags, err := listRepoTags(ctx, repo.inner)
 	if err != nil {

@@ -198,6 +198,8 @@ On the default layout, the first `Put` publishes a small, internal `wsmeta-` wor
 
 `List` derives workspace names by reading only the `state-` and `wsmeta-` tags. History (`stver-`), lock, and unlock tags are checked for valid naming but their manifests are not read, so one corrupt lock or history manifest does not fail a listing; the operations that use those tags (locking, `ListVersions`, `GetVersion`) still fail closed on their own reads.
 
+`WorkspaceExists` answers for one workspace without enumerating tags: it probes only that workspace's own state and marker (or legacy state) tag, with the same identity rules `List` applies, so a known or unknown lookup never lists the repository. Two exceptions keep it consistent with `List`: a negative legacy lookup of `default` falls back to the listing, because only the listing can prove that no workspace holds state; and repository-wide layout validation stays with `List` and the state operations, which still reject a mixed-layout repository this probe never inventories. One known discrepancy remains: the legacy listing validates at most 16 version-shaped tags per base and omits the middle candidates beyond that bound, so `List` can drop an exact literal workspace (say `state-foo-v9` among more than 16 candidates) while `WorkspaceExists` still answers `true` for it — that bound is a listing read limit, not an ownership rule, and reproducing it here would require the enumeration the API exists to avoid.
+
 `WorkspaceLayoutLegacy` exists only for compatibility with repositories created by the historical layout. New consumers should use the default hashed layout.
 
 Do not mix old and new layouts in the same repository.
