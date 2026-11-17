@@ -235,6 +235,11 @@ func TestPurge_ApplyDeletesExcessHistoryWithLiveTags(t *testing.T) {
 	for i := 1; i <= 4; i++ {
 		tag := fmt.Sprintf("stver-%s-v%d", id, i)
 		desc := seedManifest(t, repo, tag)
+		if i == 1 {
+			if err := repo.Tag(context.Background(), desc, "alias-"+id); err != nil {
+				t.Fatalf("tag alias: %v", err)
+			}
+		}
 		versions = append(versions, purgeVersion(int64(i), desc.Digest.String(), []string{tag}, time.Hour))
 	}
 
@@ -252,16 +257,14 @@ func TestPurge_ApplyDeletesExcessHistoryWithLiveTags(t *testing.T) {
 		t.Fatalf("purge: %v", err)
 	}
 
-	t.Logf("DEBUG candidates=%+v skipped=%v kept=%d", report.Candidates, report.Skipped, report.KeptTagged)
-
-	// A candidate's own history tag is still live; that must not stop the delete.
-	if len(deleted) != 2 || !strings.HasSuffix(deleted[0], "/versions/1") || !strings.HasSuffix(deleted[1], "/versions/2") {
-		t.Fatalf("deleted paths = %v, want versions 1 and 2", deleted)
+	// A candidate's own history tag must not stop deletion, but an alias must.
+	if len(deleted) != 1 || !strings.HasSuffix(deleted[0], "/versions/2") {
+		t.Fatalf("deleted paths = %v, want only version 2", deleted)
 	}
-	if len(report.Deleted) != 2 {
-		t.Errorf("report.Deleted = %+v, want 2 versions", report.Deleted)
+	if len(report.Deleted) != 1 || report.Deleted[0].VersionID != 2 {
+		t.Errorf("report.Deleted = %+v, want version 2", report.Deleted)
 	}
-	if len(report.Skipped) != 0 {
-		t.Errorf("Skipped = %v, want none", report.Skipped)
+	if len(report.Skipped) != 1 || !strings.Contains(report.Skipped[0], versions[0].Name) {
+		t.Errorf("Skipped = %v, want the aliased version 1 digest", report.Skipped)
 	}
 }
